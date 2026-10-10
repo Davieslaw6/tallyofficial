@@ -1,0 +1,7 @@
+const lum = (h) => { const [r, g, b] = [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+const ratio = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+const themes = { light: { text: '#1B2160', muted: '#4A5080', zobo: '#A3194B', leaf: '#19734F', kola: '#8A5A0E', dye: '#3342B8', bg: '#F6F6FA', panel: '#FFFFFF', kolaBg: '#FBF0DA', btnText: '#F6F6FA', btnBg: '#1B2160' },
+  dark: { text: '#EDEFFB', muted: '#A9AFDA', zobo: '#FF8DB0', leaf: '#6FD3A4', kola: '#F0C26B', dye: '#8F9BFF', bg: '#0D1030', panel: '#151A44', kolaBg: '#3A2F14', btnText: '#0D1030', btnBg: '#8F9BFF' },
+  contrast: { text: '#000000', muted: '#222222', zobo: '#8B0000', leaf: '#005A2B', kola: '#5A3A00', dye: '#0000C8', bg: '#FFFFFF', panel: '#FFFFFF', kolaBg: '#FFF1CC', btnText: '#FFFFFF', btnBg: '#000000' } };
+let bad = 0; for (const [n, t] of Object.entries(themes)) for (const [k, fg, bg] of [['text/bg', t.text, t.bg], ['text/panel', t.text, t.panel], ['muted/panel', t.muted, t.panel], ['muted/bg', t.muted, t.bg], ['out(zobo)/panel', t.zobo, t.panel], ['in(leaf)/panel', t.leaf, t.panel], ['review chip', t.kola, t.kolaBg], ['link(dye)/panel', t.dye, t.panel], ['button', t.btnText, t.btnBg]]) { const r = ratio(fg, bg); const ok = r >= 4.5; if (!ok) bad++; console.log(`${ok ? 'PASS' : 'FAIL'} ${n.padEnd(8)} ${k.padEnd(16)} ${r.toFixed(2)}:1`); }
+process.exit(bad ? 1 : 0);
