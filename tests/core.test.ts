@@ -154,3 +154,23 @@ describe('receipts', () => {
     repo.detach(a); expect(repo.db.scalar('SELECT COUNT(*) FROM attachments')).toBe(1); repo.detach(b); expect(repo.db.scalar('SELECT COUNT(*) FROM attachments')).toBe(0);
   });
 });
+
+describe('plain local vault (no passphrase)', () => {
+  it('opens straight away, persists across reopen, and stores a normal SQLite file', async () => {
+    const store = new MemoryStore(); const vm = new VaultManager(store); const s = await vm.openPlain();
+    s.db.run("INSERT INTO accounts(name,kind) VALUES('Cash','cash')"); s.touch(0); await s.flush();
+    const raw = (await store.get(`vault/${s.id}`))!; expect(new TextDecoder('latin1').decode(raw.slice(0, 15))).toBe('SQLite format 3');
+    const s2 = await vm.openPlain(); expect(s2.id).toBe(s.id); expect(s2.db.scalar<string>('SELECT name FROM accounts')).toBe('Cash'); expect((await vm.list())).toHaveLength(1);
+  });
+  it('recovers from a corrupt main file using the previous snapshot', async () => {
+    const store = new MemoryStore(); const vm = new VaultManager(store); const s = await vm.openPlain(); s.touch(0); await s.flush(); s.db.run("INSERT INTO accounts(name,kind) VALUES('A','cash')"); s.touch(0); await s.flush();
+    await store.put(`vault/${s.id}`, new TextEncoder().encode('garbage garbage garbage garbage')); const s2 = await vm.openPlain(); expect(s2.db.integrityOk()).toBe(true);
+  });
+  it('backup restore validates the file before replacing anything', async () => {
+    const vm = new VaultManager(new MemoryStore()); const s = await vm.openPlain(); await expect(vm.restorePlain(s.id, new TextEncoder().encode('not a database at all, sorry'))).rejects.toThrow();
+    const donor = await createEmptyDb(); donor.run("INSERT INTO accounts(name,kind) VALUES('FromBackup','cash')"); await vm.restorePlain(s.id, donor.export()); expect((await vm.openPlain()).db.scalar<string>('SELECT name FROM accounts')).toBe('FromBackup');
+  });
+  it('explains an old passphrase-protected vault instead of failing silently', async () => {
+    const store = new MemoryStore(); const vm = new VaultManager(store); await vm.create('Old', 'lantern-orbit-ferry-77', FAST_KDF); await expect(vm.openPlain()).rejects.toThrow(/older passphrase-protected/);
+  });
+});

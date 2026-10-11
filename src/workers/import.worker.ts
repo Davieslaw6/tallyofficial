@@ -10,6 +10,6 @@ const deny = () => { throw new Error('Network access is disabled in the import w
 for (const k of ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'importScripts', 'WebTransport'] as const) { try { Object.defineProperty(self, k, { value: deny, configurable: false, writable: false }); } catch { /* already locked */ } }
 
 self.onmessage = async (e: MessageEvent<{ name: string; data: ArrayBuffer }>) => {
-  try { const res = await parseAny(e.data.name, new Uint8Array(e.data.data), pdfjs); (self as unknown as Worker).postMessage({ ok: true, res }); }
-  catch (err: any) { (self as unknown as Worker).postMessage({ ok: false, error: err?.message ?? 'Could not read this file' }); }
+  try { const res = await parseAny(e.data.name, new Uint8Array(e.data.data), pdfjs); (self as unknown as Worker).postMessage({ tally: true, ok: true, res }); }
+  catch (err: any) { (self as unknown as Worker).postMessage({ tally: true, ok: false, error: err?.message ?? 'Could not read this file' }); }
 };

@@ -1,7 +1,7 @@
 # Debug log
 
 Two passes, run in this order. Every entry: issue, reproduction, root cause, fix, test added.
-Final state: **68 tests, 4 files, all passing** under `TZ=Africa/Lagos`, `America/New_York` and `Pacific/Auckland`. No open P0/P1.
+Final state: **72 tests, 4 files, all passing** under `TZ=Africa/Lagos`, `America/New_York` and `Pacific/Auckland`. No open P0/P1.
 
 ## What was and was not exercised
 | Area | How it was exercised |
@@ -9,7 +9,8 @@ Final state: **68 tests, 4 files, all passing** under `TZ=Africa/Lagos`, `Americ
 | DB layer, importers, reconciliation, budgets, splits, transfers, recurring, crypto, vault | Vitest unit/integration tests against real sql.js and real WebCrypto/Argon2id |
 | PDF extraction | **Synthetic** statements generated with ReportLab (`tests/fixtures/make_pdfs.py`): two layouts, multi-page, wrapped narration |
 | UI flows | One jsdom + Testing Library smoke test: onboarding, every screen, add transaction, NL bar, hotkey lock, wrong then right passphrase, data persisted through encrypted save |
-| **Not exercised** | A real browser (none available in the build sandbox): layout, visual polish, service worker, IndexedDB quotas, the import Web Worker, real bank PDFs, screen readers |
+| Real browser (Pass 3) | Headless Chromium driving the production build: setup, PDF import through the Web Worker, every screen, dark and 390px mobile, request and console logging |
+| **Not exercised** | Safari/Firefox, service-worker offline mode, IndexedDB quotas, real bank PDFs, screen readers |
 
 ## Pass 1 — functional
 | # | Sev | Issue | Reproduction | Root cause | Fix | Test |
@@ -44,7 +45,14 @@ Scenarios that passed first time:
 
 Pass 2 exit: full suite green (68 tests) in three time zones.
 
+## Pass 3 — real browser (after the redesign)
+| # | Sev | Issue | Reproduction | Root cause | Fix | Verification |
+|---|---|---|---|---|---|---|
+| 7 | **P0** | **Every import (PDF, CSV, OFX, QIF) failed in a real browser** with a blank error; tests had passed | Upload any file on the Import screen in Chromium | PDF.js starts its own message handler inside the import worker and posts a `ready` message. My code treated the first worker message as the result, rejected with an empty error and terminated the worker. The Node/jsdom tests never run the worker | Worker replies are tagged `tally: true`; the main thread ignores all other messages | Headless Chromium: PDF parsed to 10 rows, statement check "Opening + rows = closing". **No automated test covers the worker path**; it was verified by the browser script only |
+| 8 | P2 | Money table truncated dates and descriptions; mobile header wrapped to three rows; mobile table header misaligned | Screenshots at 1100px and 390px | Fixed-width columns too wide for the new 760px page; header rendered a Date column the narrow layout lacks | Narrower columns, account name moved under the description, scrollable single-row mobile nav, Date header hidden when narrow | Re-screenshotted |
+
 ## Known gaps (honest list)
 * PDF accuracy is **100% on my synthetic statements**. The "≥ 95% on typical bank PDFs" criterion is **unverified** against real Nigerian bank layouts; expect to add templates or fix heuristics once real files are tried. The importer shows a confidence per row and a "statement check" (opening + rows = closing) precisely so mistakes are visible.
 * Interrupted *page close* during a save relies on IndexedDB's own atomic transaction; not simulated beyond the failure injection above.
-* UI visuals, keyboard flow in a real browser, and the service worker have not been run in a browser.
+* Keyboard-only flow, screen readers, Safari/Firefox and the service worker's offline behaviour are untested.
+* The import worker has no automated test (see #7); a regression would only show in a browser.

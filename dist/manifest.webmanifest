@@ -1,2 +1,2 @@
-{ "name": "Tally — private money notebook", "short_name": "Tally", "start_url": "./", "scope": "./", "display": "standalone", "background_color": "#F6F6FA", "theme_color": "#1B2160",
+{ "name": "Tally — private money notebook", "short_name": "Tally", "start_url": "./", "scope": "./", "display": "standalone", "background_color": "#F5F6F6", "theme_color": "#4F6272",
   "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }] }

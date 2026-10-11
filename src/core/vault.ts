@@ -28,7 +28,8 @@ export class Session {
   private dirty = false; private rev = 0; private timer: ReturnType<typeof setTimeout> | null = null; private saving: Promise<void> = Promise.resolve();
   /** UI hook: called when a background save fails (e.g. storage full). The change stays queued and is retried. */
   onSaveError?: (e: unknown) => void;
-  constructor(public id: string, public name: string, public db: Db, private sk: SealedKey, private store: BlobStore) {}
+  /** `sk` is null for a plain (unencrypted) local vault. */
+  constructor(public id: string, public name: string, public db: Db, private sk: SealedKey | null, private store: BlobStore) {}
 
   /** Debounced encrypted write. Previous good copy is kept as `.prev` for corruption recovery. */
   touch(delay = 400) {
@@ -40,7 +41,7 @@ export class Session {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     this.saving = this.saving.catch(() => {}).then(async () => {
       if (!this.dirty) return; const rev = this.rev; const snapshot = this.db.export();
-      const blob = await seal(this.sk, snapshot);
+      const blob = this.sk ? await seal(this.sk, snapshot) : snapshot;
       const cur = await this.store.get(`vault/${this.id}`);
       if (cur) await this.store.put(`vault/${this.id}.prev`, cur);
       await this.store.put(`vault/${this.id}`, blob);
@@ -49,12 +50,13 @@ export class Session {
     return this.saving;
   }
   /** Saves first; if the save fails the vault stays open so nothing is lost. */
-  async lock() { logEvent(this.db, 'vault.lock'); this.dirty = true; this.rev++; await this.flush(); this.db.close(); this.sk.key.fill(0); }
+  async lock() { logEvent(this.db, 'vault.lock'); this.dirty = true; this.rev++; await this.flush(); this.db.close(); this.sk?.key.fill(0); }
   async exportArchive(): Promise<Uint8Array> { await this.flush(); const b = await this.store.get(`vault/${this.id}`); if (!b) throw new VaultError('not-found', 'Nothing saved yet'); return b; }
   /** Re-encrypt under a new passphrase with a fresh salt. */
   async changePassphrase(next: string, kdf: KdfParams = DEFAULT_KDF) {
+    if (!this.sk) throw new VaultError('weak-passphrase', 'This vault has no passphrase');
     if (!checkPassphrase(next).ok && kdf.m >= DEFAULT_KDF.m) throw new VaultError('weak-passphrase', checkPassphrase(next).hint);
-    this.sk.key.fill(0); this.sk = await newSealedKey(next, kdf); this.dirty = true; await this.store.del(`vault/${this.id}.prev`); await this.flush();
+    this.sk!.key.fill(0); this.sk = await newSealedKey(next, kdf); this.dirty = true; await this.store.del(`vault/${this.id}.prev`); await this.flush();
     await this.store.del(`vault/${this.id}.prev`); // old snapshot is encrypted under the old passphrase — never keep it
   }
 }
@@ -96,6 +98,23 @@ export class VaultManager {
     logEvent(db, 'vault.unlock'); const s = new Session(id, name, db, sk, this.store); s.touch(0); return s;
   }
 
+  /** Opens (or creates on first run) the single plain local vault. No passphrase; data is stored unencrypted on this device. */
+  async openPlain(name = 'Personal'): Promise<Session> {
+    await initEngine(); const all = await readProfiles(this.store); let info = all[0];
+    if (!info) {
+      const id = crypto.randomUUID(); const db = await createEmptyDb(); const s = new Session(id, name, db, null, this.store); s.touch(0); await s.flush();
+      all.push({ id, name, created: new Date().toISOString(), locked: false }); await writeProfiles(this.store, all); return s;
+    }
+    const load = async (key: string) => { const b = await this.store.get(key); if (!b) return null; if (b[0] === 0x54 && b[1] === 0x4c && b[2] === 0x59) throw new VaultError('corrupt', 'This browser holds an older passphrase-protected vault. Erase it from site data to start fresh.'); try { return await loadDb(b); } catch { return null; } };
+    let db = await load(`vault/${info.id}`); let recovered = false;
+    if (!db) { db = await load(`vault/${info.id}.prev`); recovered = !!db; }
+    if (!db) throw new VaultError('corrupt', 'The saved data could not be read.');
+    const s = new Session(info.id, info.name, db, null, this.store); if (recovered) { logEvent(db, 'restore', 'recovered from previous snapshot'); s.touch(0); } return s;
+  }
+  /** Replace a plain vault's contents with a backup file (validated as a real database first). */
+  async restorePlain(id: string, bytes: Uint8Array) {
+    const db = await loadDb(bytes); db.close(); const cur = await this.store.get(`vault/${id}`); if (cur) await this.store.put(`vault/${id}.prev`, cur); await this.store.put(`vault/${id}`, bytes);
+  }
   async importArchive(name: string, archive: Uint8Array): Promise<string> {
     readHeader(archive); const id = crypto.randomUUID();
     await this.store.put(`vault/${id}`, archive);

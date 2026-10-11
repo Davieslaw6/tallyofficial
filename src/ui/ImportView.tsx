@@ -47,22 +47,22 @@ export function ImportView() {
 
     {parsed && <>
       <div className="panel" style={{ marginBottom: 14 }}>
-        <div className="proof" style={{ marginTop: 0 }}>
+        <div className="facts" style={{ marginTop: 0 }}>
           <div><div className="l">Rows found</div><div className="v">{rows.length}</div></div><div><div className="l">Will be added</div><div className="v">{accepted.length}</div></div>
           <div><div className="l">Net of those</div><div className="v"><Money v={sum} /></div></div>
           {check !== null && <div><div className="l">Statement check</div><div className={`v ${check === 0 ? 'ok' : 'err'}`} style={{ fontSize: 18 }}>{check === 0 ? 'Opening + rows = closing' : `Off by ${formatMoney(Math.abs(check))}`}</div></div>}
         </div>
-        {parsed.warnings.map((w) => <p key={w} className="chip review" style={{ marginTop: 10 }}>{w}</p>)}
+        {parsed.warnings.map((w) => <p key={w} className="tag flag" style={{ marginTop: 10 }}>{w}</p>)}
         {parsed.skipped.length > 0 && <details style={{ marginTop: 10 }}><summary>{parsed.skipped.length} line{parsed.skipped.length > 1 ? 's' : ''} could not be read</summary><ul className="small">{parsed.skipped.slice(0, 50).map((s, i) => <li key={i}><span className="muted">Line {s.line}:</span> {s.reason} — <code>{s.text}</code></li>)}</ul></details>}
       </div>
       <div className="row" style={{ marginBottom: 10 }}>
         <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= minConf })))}>Accept all new</button><button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: false })))}>Reject all</button>
         <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= 0.9 })))}>Only the confident ones</button><span className="muted small">{flagged.length} flagged for a second look</span></div>
-      <div className="tbl"><div className="head" style={{ ['--cols' as string]: '28px 92px 1fr 160px 70px 120px' }}><span /><span>Date</span><span>Description</span><span>Category</span><span>Sure</span><span className="r">Amount</span></div>
-        <div className="scroll">{rows.slice(0, 1500).map((r) => <div key={r.key} className="tr" style={{ ['--cols' as string]: '28px 92px 1fr 160px 70px 120px', opacity: r.accept ? 1 : 0.55 }}>
+      <div className="tbl"><div className="hd" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px' }}><span /><span>Date</span><span>Description</span><span>Category</span><span>Sure</span><span className="r">Amount</span></div>
+        <div className="scroll">{rows.slice(0, 1500).map((r) => <div key={r.key} className="tr" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px', opacity: r.accept ? 1 : 0.55 }}>
           <input type="checkbox" aria-label={`Accept ${r.row.description}`} checked={r.accept} onChange={(e) => upd(r.key, { accept: e.target.checked })} />
-          <span className="cell">{r.row.date}</span>
-          <span className="cell" title={`${r.row.description}${r.row.page ? ` — page ${r.row.page}, row ${r.row.line}` : ''}`}>{r.row.description}{r.dup === 'exact' && <span className="chip bad" style={{ marginLeft: 6 }}>already saved</span>}{r.dup === 'possible' && <span className="chip review" style={{ marginLeft: 6 }}>looks like a duplicate</span>}{r.row.warnings?.map((w) => <span key={w} className="chip review" style={{ marginLeft: 6 }} title={w}>check</span>)}</span>
+          <span className="cell muted small">{r.row.date}</span>
+          <span className="cell" title={`${r.row.description}${r.row.page ? ` — page ${r.row.page}, row ${r.row.line}` : ''}`}>{r.row.description}{r.dup === 'exact' && <span className="tag bad" style={{ marginLeft: 6 }}>already saved</span>}{r.dup === 'possible' && <span className="tag flag" style={{ marginLeft: 6 }}>looks like a duplicate</span>}{r.row.warnings?.map((w) => <span key={w} className="tag flag" style={{ marginLeft: 6 }} title={w}>check</span>)}</span>
           <span className="cell"><select aria-label={`Category for ${r.row.description}`} value={r.categoryId ?? ''} onChange={(e) => upd(r.key, { categoryId: e.target.value ? +e.target.value : null, remember: true })}><option value="">Uncategorized</option>{cats.filter((c) => c.kind !== 'transfer' && (r.row.amount < 0 ? c.kind === 'expense' : c.kind === 'income')).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></span>
           <span className={`cell ${r.confidence < 0.7 ? 'err' : 'muted'}`}>{Math.round(r.confidence * 100)}%</span><span className="cell r"><Money v={r.row.amount} /></span></div>)}
         </div></div>

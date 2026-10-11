@@ -23,8 +23,8 @@ export class IdbStore implements BlobStore {
 }
 export const vaults = new VaultManager(new IdbStore());
 
-export interface Prefs { theme: 'auto' | 'light' | 'dark' | 'contrast'; density: 'compact' | 'cozy' | 'roomy'; lockMinutes: number }
-const DEF: Prefs = { theme: 'auto', density: 'cozy', lockMinutes: 5 };
+export interface Prefs { theme: 'auto' | 'light' | 'dark' | 'contrast'; density: 'compact' | 'cozy' | 'roomy' }
+const DEF: Prefs = { theme: 'auto', density: 'cozy' };
 export const loadPrefs = (): Prefs => { try { return { ...DEF, ...JSON.parse(localStorage.getItem('tally.prefs') ?? '{}') }; } catch { return DEF; } };
 export function applyPrefs(p: Prefs) {
   try { localStorage.setItem('tally.prefs', JSON.stringify(p)); } catch { /* storage may be blocked */ }
