@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { useApp } from './store';
 import { Money, Ribbon, Section, Empty } from './ui';
+import { MonthsChart, Outlook } from './charts';
 import { formatMoney, compactMoney } from '../core/money';
 import { monthRange, shiftMonth } from '../core/dates';
 import { budgetStatus, insights, forecast } from '../core/analytics';
@@ -24,7 +25,6 @@ export function Today({ play }: { play: boolean }) {
   const diff = d.ie.expense - d.pie.expense;
   if (!d.accts.length) return <Empty title="No accounts yet" body="Add an account in Settings, then import a statement or add a transaction." />;
   const empty = d.ie.expense === 0 && d.ie.income === 0;
-  const max = Math.max(1, ...d.series.map((s) => Math.max(s.income, s.expense)));
   const low = d.fc.reduce((m, p) => (p.balance < m.balance ? p : m), d.fc[0]);
 
   return <div className="sheet">
@@ -43,11 +43,7 @@ export function Today({ play }: { play: boolean }) {
     {d.ins.length > 0 && <Section title="Worth a look">
       <div className="list">{d.ins.map((i) => <div key={i.id}><strong>{i.title}</strong><div className="muted small">{i.body}</div></div>)}</div></Section>}
 
-    <Section title="Six months">
-      <div className="bars" role="img" aria-label={d.series.map((s) => `${monthName(s.month)}: in ${formatMoney(s.income)}, out ${formatMoney(s.expense)}`).join('; ')} style={{ gridTemplateColumns: 'repeat(6, 1fr)', marginBottom: 30 }}>
-        {d.series.map((s) => <div className="col" key={s.month}><i style={{ height: `${(s.income / max) * 100}%`, background: 'var(--in)' }} /><i style={{ height: `${(s.expense / max) * 100}%`, background: 'var(--out)' }} /><span className="lab">{MN[Number(s.month.slice(5)) - 1].slice(0, 3)}</span></div>)}
-      </div>
-      <p className="small muted"><span style={{ color: 'var(--in)' }}>■</span> money in <span style={{ color: 'var(--out)', marginLeft: 12 }}>■</span> money out. Transfers between your own accounts are left out.</p></Section>
+    <Section title="Six months"><MonthsChart series={d.series} /></Section>
 
     {d.bud.length > 0 && <Section title="Budgets" actions={<button className="btn quiet small" onClick={() => go('plan')}>All budgets</button>}>
       <div className="list">{d.bud.map((b) => <div key={b.categoryId}><div className="row" style={{ justifyContent: 'space-between' }}><strong>{b.name}</strong><span className="small"><Money v={-b.spent} plain /> of <Money v={b.limit} plain /></span></div><div className={`meter ${b.state}`} role="progressbar" aria-valuenow={Math.round(b.ratio * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={`${b.name} budget`}><i style={{ width: `${Math.min(100, b.ratio * 100)}%` }} /></div></div>)}</div></Section>}
@@ -56,12 +52,6 @@ export function Today({ play }: { play: boolean }) {
       <div className="list">{d.accts.map((a) => <div key={a.id} className="row" style={{ justifyContent: 'space-between' }}><span>{a.name} <span className="muted small">{a.kind}</span></span><Money v={a.bal} plain /></div>)}</div></Section>
 
     {d.fc.length > 1 && <Section title="Next 60 days"><p>{low.balance < 0 ? <>Your balance could dip below zero around <strong>{low.date}</strong> ({compactMoney(low.balance)}) if spending continues at its recent pace.</> : <>At your recent pace you would have about <strong><Money v={d.fc[d.fc.length - 1].balance} plain /></strong> in 60 days.</>}</p>
-      <Spark pts={d.fc.map((p) => p.balance)} /><p className="small muted">Based on your recurring items and the last 90 days of other spending.</p></Section>}
+      <Outlook pts={d.fc.map((p) => p.balance)} startDate={d.fc[0].date} endDate={d.fc[d.fc.length - 1].date} /><p className="small muted">Based on your recurring items and the last 90 days of other spending.</p></Section>}
   </div>;
-}
-
-function Spark({ pts }: { pts: number[] }) {
-  const w = 600, h = 80, mn = Math.min(...pts, 0), mx = Math.max(...pts, 1), sx = w / (pts.length - 1), y = (v: number) => h - ((v - mn) / (mx - mn || 1)) * (h - 8) - 4;
-  const dpath = pts.map((p, i) => `${i ? 'L' : 'M'}${(i * sx).toFixed(1)},${y(p).toFixed(1)}`).join(' ');
-  return <svg viewBox={`0 0 ${w} ${h}`} width="100%" height="80" preserveAspectRatio="none" role="img" aria-label="Projected balance"><line x1="0" x2={w} y1={y(0)} y2={y(0)} stroke="var(--line)" strokeDasharray="4 4" /><path d={dpath} fill="none" stroke="var(--slate)" strokeWidth="2.5" vectorEffect="non-scaling-stroke" /></svg>;
 }

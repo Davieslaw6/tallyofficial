@@ -123,3 +123,24 @@ input[type='checkbox'] { width: 16px; height: 16px; min-height: 0; accent-color:
   .nav button { white-space: nowrap; padding: 8px 12px; }
 }
 @media (max-width: 720px) { .tbl .sub { display: none; } }
+
+/* ---------- six-month chart */
+.chart { margin-top: 6px; }
+.plot { position: relative; height: 200px; margin: 18px 0 30px 44px; }
+.plot .axis, .plot .grid { position: absolute; inset: 0; pointer-events: none; }
+.plot .axis span { position: absolute; left: -44px; width: 38px; text-align: right; transform: translateY(50%); font-size: 12px; color: var(--quiet); }
+.plot .grid i { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--line); } .plot .grid i:last-child { border-top: 1px solid var(--line); }
+.cols { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+.col { position: relative; background: none; border: 0; padding: 0; cursor: pointer; font: inherit; color: var(--quiet); }
+.col .barbox { position: absolute; inset: 0; display: block; }
+.col .bar { position: absolute; left: 50%; bottom: 0; width: min(46%, 44px); transform: translateX(-50%); background: var(--t4); border-radius: 4px 4px 0 0; min-height: 2px; transition: background .12s; }
+.col:hover .bar { background: var(--t2); } .col.on .bar { background: var(--slate); }
+.col .tick { position: absolute; left: 50%; width: min(70%, 62px); height: 2px; transform: translate(-50%, 1px); background: var(--in); border-radius: 1px; }
+.col .val { position: absolute; left: 50%; transform: translateX(-50%); font-size: 12px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+.col .mon { position: absolute; left: 0; right: 0; top: calc(100% + 8px); font-size: 13px; text-align: center; } .col.on .mon { color: var(--ink); font-weight: 600; } .col .yr { font-weight: 400; color: var(--quiet); }
+.col:focus-visible { outline-offset: 4px; }
+.readout { margin: 18px 0 8px; } .readout strong { margin-right: 8px; }
+.key { font-size: 13px; color: var(--quiet); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px; } .key .note { flex-basis: 100%; }
+.key .k-bar { width: 10px; height: 10px; border-radius: 2px; background: var(--slate); display: inline-block; margin-right: 2px; } .key .k-tick { width: 14px; height: 2px; background: var(--in); display: inline-block; margin-right: 2px; vertical-align: middle; }
+@media (max-width: 640px) { .plot { margin-left: 40px; height: 170px; } .plot .axis span { left: -40px; width: 34px; } .cols { gap: 3px; } }
+.outlook svg { display: block; margin-top: 10px; } .outlook .ends { display: flex; justify-content: space-between; margin-top: 6px; }
