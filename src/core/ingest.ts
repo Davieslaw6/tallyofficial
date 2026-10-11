@@ -31,9 +31,21 @@ export function prepareReview(repo: Repo, parsed: ParsedStatement, accountId: nu
   });
 }
 
+/** Reverse the direction of one review row (money in ⇄ money out), re-suggesting its category unless the user already chose one. */
+export function flipRow(r: ReviewRow, cat: Categorizer): ReviewRow {
+  const amount = -r.row.amount; const untouched = r.categoryId === r.suggestedId; const s = cat.suggest(r.row.description, amount);
+  return { ...r, row: { ...r.row, amount }, categoryId: untouched ? s.categoryId : r.categoryId, suggestedId: s.categoryId, via: s.via };
+}
+/** Hashes depend on the amount's sign, so recompute them (with per-file occurrence counters) after any flips. */
+function rehash(rows: ReviewRow[], accountId: number): ReviewRow[] {
+  const seen = new Map<string, number>();
+  return rows.map((r) => { const base = importHash(accountId, r.row.date, r.row.amount, r.row.description, 0); const occ = seen.get(base) ?? 0; seen.set(base, occ + 1); return { ...r, hash: importHash(accountId, r.row.date, r.row.amount, r.row.description, occ) }; });
+}
+
 export class AlreadyImported extends Error {}
 
 export function commitReview(repo: Repo, accountId: number, rows: ReviewRow[], cat: Categorizer, meta: { fileBytes: Uint8Array; format: string; parsed: ParsedStatement }) {
+  rows = rehash(rows, accountId);
   const fileHash = sha256Sync(meta.fileBytes);
   if (repo.db.scalar('SELECT 1 FROM statements WHERE account_id=? AND file_hash=?', [accountId, fileHash]) !== undefined) throw new AlreadyImported('This exact file was already imported into this account.');
   let added = 0;

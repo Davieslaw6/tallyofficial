@@ -6,7 +6,8 @@ import { parseCsv, toCsv, parseCsvText } from '../src/core/import/csv';
 import { parseOfx } from '../src/core/import/ofx';
 import { parseQif } from '../src/core/import/qif';
 import { parseAny, sniff, ImportError } from '../src/core/import';
-import { prepareReview, commitReview, makeCategorizer, AlreadyImported } from '../src/core/ingest';
+import { parseStatementItems, solveDirections } from '../src/core/import/pdf';
+import { prepareReview, commitReview, makeCategorizer, AlreadyImported, flipRow } from '../src/core/ingest';
 import { reconcile, auditReportHtml } from '../src/core/reconcile';
 import { findDuplicates, findOutliers, detectSubscriptions, forecast, budgetStatus, insights, findGaps } from '../src/core/analytics';
 import { ask } from '../src/core/nlq';
@@ -129,5 +130,42 @@ describe('analytics', () => {
     expect(ask(repo, 'income in february', t).text).toMatch(/500,000\.00/); expect(ask(repo, 'what is my balance', t).text).toMatch(/total balance/);
     expect(ask(repo, 'how much did I spend at shoprite in february', t).text).toMatch(/12,500\.00/); expect(ask(repo, 'top categories last month', t).rows?.[0].label).toBe('Groceries');
     expect(ask(repo, 'blah blah', t).understood).toBe(false);
+  });
+});
+
+describe('PDF direction (money in vs money out) — regression for "everything imported as money in"', () => {
+  const layouts: [string, string][] = [['single Amount column, no balance, no markers', 'stmt_amount_only.pdf'], ['Type column (Debit/Credit)', 'stmt_typecol.pdf'], ['headers "Debit (₦)" / "Credit (₦)", no balance', 'stmt_debitcredit_naira.pdf'], ['headers "Withdrawals" / "Lodgements", no balance', 'stmt_withdrawals.pdf']];
+  for (const [name, file] of layouts) it(`${name}: debits are money out, credits are money in, and opening + rows = closing`, async () => {
+    const r = await parseAny('s.pdf', pdf(file), pdfjs); const amounts = r.rows.map((x) => x.amount);
+    expect(amounts).toEqual([-1850000, 45000000, -200000, -320050, -1050000, -2000000, 1500000, -2500000]);
+    expect(r.rows.filter((x) => x.amount < 0)).toHaveLength(6); expect(r.rows.filter((x) => x.amount > 0)).toHaveLength(2);
+    expect(r.openingBalance! + amounts.reduce((a, b) => a + b, 0)).toBe(r.closingBalance);
+    expect(r.rows.every((x) => !x.description.match(/^(debit|credit)$/i) && !/\b(Debit|Credit)\b$/.test(x.description))).toBe(true); // Type cell is not left in the narration
+  });
+  it('explicit minus signs and brackets are trusted as money out', () => {
+    const it = (str: string, x: number, y: number) => ({ str, x, y, w: str.length * 5, page: 1 });
+    const pages = [[it('Date', 40, 700), it('Description', 110, 700), it('Amount', 500, 700), it('01 Mar 2026', 40, 680), it('GENERIC ITEM ONE', 110, 680), it('-1,500.00', 500, 680), it('02 Mar 2026', 40, 664), it('GENERIC ITEM TWO', 110, 664), it('(250.00)', 500, 664), it('03 Mar 2026', 40, 648), it('GENERIC ITEM THREE', 110, 648), it('4,000.00', 500, 648)]];
+    const r = parseStatementItems(pages as never); expect(r.rows.map((x) => x.amount)).toEqual([-150000, -25000, -400000]); // third row has no clue: assumed out and flagged
+    expect(r.rows[2].confidence).toBeLessThan(0.7); expect(r.warnings.join(' ')).toMatch(/could not be confirmed/);
+  });
+  it('rows with no clue at all are worked out from the statement balances (and the guess is flagged otherwise)', () => {
+    const it = (str: string, x: number, y: number, w = str.length * 5) => ({ str, x, y, w, page: 1 });
+    const mk = (open: string, close: string) => [[it('Date', 40, 700), it('Description', 110, 700), it('Amount', 500, 700), it('Opening Balance', 110, 684), it('10,000.00', 520, 684),
+      it('01 Mar 2026', 40, 668), it('ITEM ALPHA 1', 110, 668), it('3,000.00', 500, 668), it('02 Mar 2026', 40, 652), it('ITEM BETA 2', 110, 652), it('7,500.00', 500, 652), it('03 Mar 2026', 40, 636), it('ITEM GAMMA 3', 110, 636), it('1,250.00', 500, 636), it('Closing Balance', 110, 620), it(close, 520, 620)]];
+    // alpha out 3000, beta IN 7500, gamma out 1250 → 10000 - 3000 + 7500 - 1250 = 13250
+    const ok = parseStatementItems(mk('10,000.00', '13,250.00') as never); expect(ok.rows.map((x) => x.amount)).toEqual([-300000, 750000, -125000]); expect(ok.rows.every((x) => x.confidence >= 0.9)).toBe(true); expect(ok.warnings.join(' ')).toMatch(/worked out from the opening and closing/);
+    const unsolvable = parseStatementItems(mk('10,000.00', '13,251.00') as never); expect(unsolvable.rows.every((x) => x.confidence < 0.7)).toBe(true);
+  });
+  it('solveDirections: finds the unique smallest fix, refuses ambiguous or impossible cases', () => {
+    const rows = [{ amount: -300 }, { amount: -700 }, { amount: -500 }]; // guessed all out; truth: second row is in → total should be -300+700-500 = -100
+    expect(solveDirections(rows, [0, 1, 2], 1000, 900)).toEqual([1]); expect(solveDirections(rows, [0, 1, 2], 1000, 1000 - 1500)).toEqual([]);
+    expect(solveDirections([{ amount: -100 }, { amount: -100 }], [0, 1], 1000, 1000)).toBeNull(); // two equal rows: either could be the one → ambiguous
+    expect(solveDirections(rows, [0, 1, 2], 1000, 1234)).toBeNull(); // odd/impossible difference
+  });
+  it('flipping a review row reverses its sign, re-suggests its category and stays importable (hashes are recomputed)', async () => {
+    const { repo, acct } = await freshRepo(); const parsed = parseCsv('Date,Description,Amount\n2026-03-01,SALARY ACME LTD,500.00\n2026-03-02,SHOPRITE LEKKI,500.00\n'); const cat = makeCategorizer(repo); let rv = prepareReview(repo, parsed, acct, cat);
+    const name = (id: number | null) => repo.categories().find((c) => c.id === id)?.name; expect(name(rv[0].categoryId)).toBe('Salary');
+    rv = rv.map((r) => flipRow(r, cat)); expect(rv.map((r) => r.row.amount)).toEqual([-50000, -50000]); expect(name(rv[0].categoryId)).not.toBe('Salary'); expect(name(rv[1].categoryId)).toBe('Groceries'); // was a credit, now a debit at Shoprite
+    commitReview(repo, acct, rv, cat, { fileBytes: new TextEncoder().encode('flip'), format: 'csv', parsed }); expect(repo.list().map((t) => t.amount)).toEqual([-50000, -50000]);
   });
 });

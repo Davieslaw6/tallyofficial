@@ -1,0 +1,605 @@
+diff --git a/DEBUG_LOG.md b/DEBUG_LOG.md
+index 17f7409..5e0d64f 100644
+--- a/DEBUG_LOG.md
++++ b/DEBUG_LOG.md
+@@ -51,6 +51,12 @@ Pass 2 exit: full suite green (68 tests) in three time zones.
+ | 7 | **P0** | **Every import (PDF, CSV, OFX, QIF) failed in a real browser** with a blank error; tests had passed | Upload any file on the Import screen in Chromium | PDF.js starts its own message handler inside the import worker and posts a `ready` message. My code treated the first worker message as the result, rejected with an empty error and terminated the worker. The Node/jsdom tests never run the worker | Worker replies are tagged `tally: true`; the main thread ignores all other messages | Headless Chromium: PDF parsed to 10 rows, statement check "Opening + rows = closing". **No automated test covers the worker path**; it was verified by the browser script only |
+ | 8 | P2 | Money table truncated dates and descriptions; mobile header wrapped to three rows; mobile table header misaligned | Screenshots at 1100px and 390px | Fixed-width columns too wide for the new 760px page; header rendered a Date column the narrow layout lacks | Narrower columns, account name moved under the description, scrollable single-row mobile nav, Date header hidden when narrow | Re-screenshotted |
+ 
++## Pass 4 â€” user-reported: PDF import treated every row as money in
++| # | Sev | Issue | Reproduction | Root cause | Fix | Test |
++|---|---|---|---|---|---|---|
++| 9 | **P0** | **PDF statements imported with every row as money in; no money out** | Four layouts generated in `tests/fixtures/make_pdfs.py`: single *Amount* column with no running balance; a *Type* column (Debit/Credit); headers `Debit (â‚¦)` / `Credit (â‚¦)`; headers `Withdrawals` / `Lodgements`. Before the fix each gave 0 money-out rows and opening + rows â‰  closing | (a) Column headers were matched exactly, so `Debit (â‚¦)`, `Withdrawals`, `Lodgements` were not recognised. (b) With no column, DR/CR marker or running balance, the parser kept the printed (positive) amount and only attached a warning. (c) A *Type* cell was not read as a direction | Tolerant header matching (letters only; adds withdrawal, lodgement, money out/inâ€¦); Type column read as direction and removed from the narration; fallback chain: running balance â†’ explicit minus/brackets/DR-CR/Type â†’ narration clues â†’ assume money out (flagged); then `solveDirections` uses the statement's opening and closing balances to confirm or correct guessed rows (applies only when the fix is unique); review screen gets **Flip** per row and **Flip every row**, and the statement check recalculates live; hashes recomputed after flips | `import.test.ts â€º PDF directionâ€¦` (4 layouts, explicit signs, solver, ambiguous/impossible cases, flip + commit). Verified in headless Chromium: 6 out / 2 in, statement check passes |
++Why earlier tests missed it: my first synthetic PDFs all had separate Debit/Credit headers with exact wording or a running balance.
++
+ ## Known gaps (honest list)
+ * PDF accuracy is **100% on my synthetic statements**. The "â‰¥ 95% on typical bank PDFs" criterion is **unverified** against real Nigerian bank layouts; expect to add templates or fix heuristics once real files are tried. The importer shows a confidence per row and a "statement check" (opening + rows = closing) precisely so mistakes are visible.
+ * Interrupted *page close* during a save relies on IndexedDB's own atomic transaction; not simulated beyond the failure injection above.
+diff --git a/src/core/import/pdf.ts b/src/core/import/pdf.ts
+index 936b525..e93f955 100644
+--- a/src/core/import/pdf.ts
++++ b/src/core/import/pdf.ts
+@@ -49,7 +49,34 @@ function toLines(pages: TextItem[][]): Line[] {
+ const AMOUNT = /^[(\-]?(?:[â‚¦N]\s?)?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?[)\-]?(?:\s?(?:CR|DR|Cr|Dr))?$|^[(\-]?\d+\.\d{2}[)\-]?(?:\s?(?:CR|DR|Cr|Dr))?$/;
+ const isAmount = (s: string) => AMOUNT.test(s.replace(/\s/g, ' ').trim()) && /\d/.test(s) && (s.includes('.') || s.includes(',') || /(CR|DR)$/i.test(s));
+ const DATE_AT_START = /^(\d{1,2}[-/. ](?:\d{1,2}|[A-Za-z]{3,9})(?:[-/. ,]+\d{2,4})?|\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4})(?=\s|$)/;
+-const HEADER_WORDS = { debit: /^(debit|debits|withdrawals?|money out|paid out|dr)$/i, credit: /^(credit|credits|deposits?|money in|paid in|cr)$/i, balance: /^(balance|running balance|closing balance)$/i };
++/** Header cells are compared after stripping everything but letters, so "Debit (â‚¦)", "DEBIT AMOUNT" and "Money Out" all match. */
++const norm = (t: string) => t.toLowerCase().replace(/[^a-z]/g, '');
++const HEADER_WORDS = {
++  debit: { test: (t: string) => { const n = norm(t); return n === 'dr' || /^(debit|withdraw|moneyout|paidout|outflow|paymentsout|amountout)/.test(n); } },
++  credit: { test: (t: string) => { const n = norm(t); return n === 'cr' || /^(credit|deposit|lodg?e?ment|moneyin|paidin|inflow|receipts|paymentsin|amountin)/.test(n); } },
++  balance: { test: (t: string) => /^(balance|runningbalance|closingbalance|bal)$/.test(norm(t)) || /^balance/.test(norm(t)) },
++};
++
++/** Last-resort direction clues from the narration when the layout gives no column, marker or running balance. */
++const POSITIVE = /\b(salary|payroll|wages|deposit|lodg?e?ment|interest (?:paid|credit)|credit interest|refund|reversal|cashback|dividend|transfer from|trf from|received|inward|credit alert)\b/i;
++const NEGATIVE = /\b(pos|wdl|withdrawal|atm|purchase|airtime|vtu|data bundle|bill|charge|fee|levy|stamp duty|vat|commission|subscription|transfer to|trf to|payment|debit|rent|maintenance|sms alert)\b/i;
++function cueDirection(desc: string): -1 | 0 | 1 { const p = POSITIVE.test(desc), n = NEGATIVE.test(desc); return p && !n ? 1 : n && !p ? -1 : p && n ? (/transfer from|trf from|salary|refund|reversal/i.test(desc) ? 1 : -1) : 0; }
++
++/** If the statement's opening and closing balances are known, find the (unique, smallest) set of guessed rows whose
++ *  direction must be flipped for opening + rows = closing. Returns indexes to flip, or null when it cannot be decided. */
++export function solveDirections(rows: { amount: number }[], guessed: number[], opening: number, closing: number): number[] | null {
++  const D = closing - opening - rows.reduce((s, r) => s + r.amount, 0); if (D === 0) return [];
++  if (D % 2 !== 0 || guessed.length === 0 || guessed.length > 24) return null;
++  const target = -D / 2; const vals = guessed.map((i) => rows[i].amount); const h = guessed.length >> 1;
++  const halves = [vals.slice(0, h), vals.slice(h)]; const sums = (a: number[]) => { const r: [number, number][] = [[0, 0]]; a.forEach((v, i) => { const n = r.length; for (let k = 0; k < n; k++) r.push([r[k][0] + v, r[k][1] | (1 << i)]); }); return r; };
++  const left = sums(halves[0]), right = new Map<number, number[]>(); for (const [sm, mask] of sums(halves[1])) (right.get(sm) ?? right.set(sm, []).get(sm)!).push(mask);
++  let best: number[] | null = null, bestN = 99, ties = 0;
++  for (const [sm, lm] of left) for (const rm of right.get(target - sm) ?? []) {
++    const idx = [...halves[0].map((_, i) => (lm >> i) & 1 ? guessed[i] : -1), ...halves[1].map((_, i) => (rm >> i) & 1 ? guessed[h + i] : -1)].filter((x) => x >= 0);
++    if (idx.length < bestN) { best = idx; bestN = idx.length; ties = 1; } else if (idx.length === bestN) ties++;
++  }
++  return best && ties === 1 ? best : null;
++}
+ 
+ function loosDate(s: string, year: number | null, dayFirst = true): string | null {
+   const direct = parseDate(s, dayFirst); if (direct) return direct;
+@@ -70,7 +97,7 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
+   // column anchors from the table header row
+   let cols: { kind: 'debit' | 'credit' | 'balance'; c: number; r: number }[] = [];
+   let prevBal: number | null = null; let descX: number | null = null; let last: ParsedRow | null = null; let seq = 0;
+-  let balanceVerified = 0, balanceMismatch = 0;
++  let balanceVerified = 0, balanceMismatch = 0; const guessed: number[] = [];
+ 
+   for (let li = 0; li < lines.length; li++) {
+     const ln = lines[li]; const t = ln.text;
+@@ -97,7 +124,8 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
+     let cells = ln.cells.slice(); let rest = first.text.slice(dm![0].length).trim(); cells.shift();
+     if (rest) cells.unshift({ text: rest, x0: first.x0 + 40, x1: first.x1 });
+     if (cells[0] && DATE_AT_START.test(cells[0].text) && loosDate(DATE_AT_START.exec(cells[0].text)![1], year) && !isAmount(cells[0].text) && cells[0].text.length < 14) cells.shift(); // value date
+-    const nums = cells.filter((c) => isAmount(c.text)); const textCells = cells.filter((c) => !isAmount(c.text));
++    const nums = cells.filter((c) => isAmount(c.text)); const isTypeCell = (c: Cell) => /^(debit|dr|d|credit|cr|c)$/i.test(c.text.trim());
++    const typeCell = cells.find((c) => !isAmount(c.text) && isTypeCell(c)); const textCells = cells.filter((c) => !isAmount(c.text) && !isTypeCell(c));
+     let desc = sanitize(textCells.map((c) => c.text).join(' ')); if (!nums.length || !desc) { out.skipped.push({ line: li + 1, text: t.slice(0, 120), reason: !nums.length ? 'No amount found' : 'No description' }); continue; }
+ 
+     let amount: number | null = null, balance: number | null = null; const warnings: string[] = []; let conf = 0.9;
+@@ -111,8 +139,18 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
+     if (amount === null && balance !== null && prevBal !== null) amount = balance - prevBal; // only a balance printed
+     if (amount === null) { out.skipped.push({ line: li + 1, text: t.slice(0, 120), reason: 'Amount column unclear' }); continue; }
+ 
+-    const marker = nums.map((n) => /DR$/i.test(n.text.trim()) ? -1 : /CR$/i.test(n.text.trim()) ? 1 : 0).find((m) => m !== 0);
+-    if (!cols.length) { if (balance !== null && prevBal !== null) { const up: boolean = prevBal + Math.abs(amount) === balance, down: boolean = prevBal - Math.abs(amount) === balance; if (up !== down) amount = (up ? 1 : -1) * Math.abs(amount); } else if (marker) amount = marker * Math.abs(amount); else if (amount > 0) { warnings.push('Direction guessed â€” check sign'); conf = 0.55; } }
++    const marker = typeCell ? (/^(debit|dr|d)$/i.test(typeCell.text.trim()) ? -1 : 1) : nums.map((n) => /DR$/i.test(n.text.trim()) ? -1 : /CR$/i.test(n.text.trim()) ? 1 : 0).find((m) => m !== 0);
++    if (!cols.length) {
++      // Direction, in order of trust: running balance â†’ explicit sign / DR-CR marker / Type column â†’ narration clues â†’ assume money out.
++      let decided = false;
++      if (balance !== null && prevBal !== null) { const up: boolean = prevBal + Math.abs(amount) === balance, down: boolean = prevBal - Math.abs(amount) === balance; if (up !== down) { amount = (up ? 1 : -1) * Math.abs(amount); decided = true; } }
++      if (!decided && marker) { amount = marker * Math.abs(amount); decided = true; }
++      if (!decided && amount < 0) decided = true; // the statement printed an explicit minus or brackets
++      if (!decided) {
++        const cue = cueDirection(desc); amount = (cue || -1) * Math.abs(amount); guessed.push(out.rows.length);
++        warnings.push(cue ? 'Direction inferred from the description' : 'Direction unknown, assumed money out'); conf = cue ? 0.6 : 0.5;
++      }
++    }
+     if (balance !== null && prevBal !== null) {
+       if (prevBal + amount === balance) { balanceVerified++; conf = 0.97; }
+       else if (prevBal - amount === balance && amount !== 0) { amount = -amount; balanceVerified++; conf = 0.9; warnings.push('Sign corrected from running balance'); }
+@@ -128,6 +166,16 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
+   if (!out.rows.length) throw new ImportError('No transactions could be read. This layout may need a bank template or a CSV export.');
+   if (out.openingBalance == null) { const f = out.rows[0]; if (f.balance != null) out.openingBalance = f.balance - f.amount; }
+   if (out.closingBalance == null) { const l = [...out.rows].reverse().find((r) => r.balance != null); if (l) out.closingBalance = l.balance; }
++  if (guessed.length) {
++    // No column or marker told us the direction for these rows. If the statement's opening and closing balances are known,
++    // they can confirm or correct the guesses: opening + every signed row must equal closing.
++    const flip = out.openingBalance != null && out.closingBalance != null ? solveDirections(out.rows, guessed, out.openingBalance, out.closingBalance) : null;
++    if (flip) {
++      for (const i of flip) out.rows[i].amount = -out.rows[i].amount;
++      for (const i of guessed) { const r = out.rows[i]; r.confidence = 0.9; r.warnings = flip.includes(i) ? ['Direction corrected using the statement balances'] : undefined; } // confirmed rows need no flag
++      out.warnings.push(`${guessed.length} row(s) did not state money in or out; the direction was worked out from the opening and closing balances${flip.length ? ` (${flip.length} corrected)` : ''}.`);
++    } else out.warnings.push(`${guessed.length} row(s) did not state money in or out and could not be confirmed against the statement balances. Directions were guessed from the descriptions, so check them (use Flip in the review).`);
++  }
+   if (balanceMismatch) out.warnings.push(`${balanceMismatch} row(s) do not follow the running balance â€” review the flagged lines.`);
+   if (!balanceVerified && !cols.length) out.warnings.push('No running balance was found, so amounts could not be cross-checked.');
+   return out;
+diff --git a/src/core/ingest.ts b/src/core/ingest.ts
+index aebc650..f6fe6e5 100644
+--- a/src/core/ingest.ts
++++ b/src/core/ingest.ts
+@@ -31,9 +31,21 @@ export function prepareReview(repo: Repo, parsed: ParsedStatement, accountId: nu
+   });
+ }
+ 
++/** Reverse the direction of one review row (money in â‡„ money out), re-suggesting its category unless the user already chose one. */
++export function flipRow(r: ReviewRow, cat: Categorizer): ReviewRow {
++  const amount = -r.row.amount; const untouched = r.categoryId === r.suggestedId; const s = cat.suggest(r.row.description, amount);
++  return { ...r, row: { ...r.row, amount }, categoryId: untouched ? s.categoryId : r.categoryId, suggestedId: s.categoryId, via: s.via };
++}
++/** Hashes depend on the amount's sign, so recompute them (with per-file occurrence counters) after any flips. */
++function rehash(rows: ReviewRow[], accountId: number): ReviewRow[] {
++  const seen = new Map<string, number>();
++  return rows.map((r) => { const base = importHash(accountId, r.row.date, r.row.amount, r.row.description, 0); const occ = seen.get(base) ?? 0; seen.set(base, occ + 1); return { ...r, hash: importHash(accountId, r.row.date, r.row.amount, r.row.description, occ) }; });
++}
++
+ export class AlreadyImported extends Error {}
+ 
+ export function commitReview(repo: Repo, accountId: number, rows: ReviewRow[], cat: Categorizer, meta: { fileBytes: Uint8Array; format: string; parsed: ParsedStatement }) {
++  rows = rehash(rows, accountId);
+   const fileHash = sha256Sync(meta.fileBytes);
+   if (repo.db.scalar('SELECT 1 FROM statements WHERE account_id=? AND file_hash=?', [accountId, fileHash]) !== undefined) throw new AlreadyImported('This exact file was already imported into this account.');
+   let added = 0;
+diff --git a/src/ui/ImportView.tsx b/src/ui/ImportView.tsx
+index b8f1344..4612602 100644
+--- a/src/ui/ImportView.tsx
++++ b/src/ui/ImportView.tsx
+@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
+ import { useApp } from './store';
+ import { Money, Section, Empty } from './ui';
+ import { parseInWorker } from './parse';
+-import { prepareReview, commitReview, AlreadyImported, type ReviewRow } from '../core/ingest';
++import { prepareReview, commitReview, flipRow, AlreadyImported, type ReviewRow } from '../core/ingest';
+ import type { ParsedStatement } from '../core/import/types';
+ import { reconcile } from '../core/reconcile';
+ import { formatMoney } from '../core/money';
+@@ -20,10 +20,12 @@ export function ImportView() {
+       setParsed(res); setRows(prepareReview(repo, res, acct, cat));
+     } catch (e) { setErr(e instanceof Error ? e.message : 'Could not read this file'); } finally { setBusy(false); }
+   }
++  const flip = (k: number) => setRows((r) => r.map((x) => (x.key === k ? flipRow(x, cat) : x)));
+   const upd = (k: number, p: Partial<ReviewRow>) => setRows((r) => r.map((x) => (x.key === k ? { ...x, ...p } : x)));
+   const accepted = rows.filter((r) => r.accept); const flagged = rows.filter((r) => r.confidence < 0.7 || r.dup !== 'none' || r.row.warnings?.length);
++  // recomputed on every render so flips show immediately
+   const sum = accepted.reduce((s, r) => s + r.row.amount, 0);
+-  const check = parsed && parsed.openingBalance != null && parsed.closingBalance != null ? parsed.openingBalance + parsed.rows.reduce((s, r) => s + r.amount, 0) - parsed.closingBalance : null;
++  const check = parsed && parsed.openingBalance != null && parsed.closingBalance != null ? parsed.openingBalance + rows.reduce((s, r) => s + r.row.amount, 0) - parsed.closingBalance : null;
+ 
+   function save() {
+     if (!parsed) return;
+@@ -57,14 +59,14 @@ export function ImportView() {
+       </div>
+       <div className="row" style={{ marginBottom: 10 }}>
+         <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= minConf })))}>Accept all new</button><button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: false })))}>Reject all</button>
+-        <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= 0.9 })))}>Only the confident ones</button><span className="muted small">{flagged.length} flagged for a second look</span></div>
+-      <div className="tbl"><div className="hd" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px' }}><span /><span>Date</span><span>Description</span><span>Category</span><span>Sure</span><span className="r">Amount</span></div>
+-        <div className="scroll">{rows.slice(0, 1500).map((r) => <div key={r.key} className="tr" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px', opacity: r.accept ? 1 : 0.55 }}>
++        <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= 0.9 })))}>Only the confident ones</button><button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => flipRow(x, cat)))} title="Swap money in and money out on every row">Flip every row</button><span className="muted small">{flagged.length} flagged for a second look</span></div>
++      <div className="tbl"><div className="hd" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px 44px' }}><span /><span>Date</span><span>Description</span><span>Category</span><span>Sure</span><span className="r">Amount</span><span /></div>
++        <div className="scroll">{rows.slice(0, 1500).map((r) => <div key={r.key} className="tr" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px 44px', opacity: r.accept ? 1 : 0.55 }}>
+           <input type="checkbox" aria-label={`Accept ${r.row.description}`} checked={r.accept} onChange={(e) => upd(r.key, { accept: e.target.checked })} />
+           <span className="cell muted small">{r.row.date}</span>
+           <span className="cell" title={`${r.row.description}${r.row.page ? ` â€” page ${r.row.page}, row ${r.row.line}` : ''}`}>{r.row.description}{r.dup === 'exact' && <span className="tag bad" style={{ marginLeft: 6 }}>already saved</span>}{r.dup === 'possible' && <span className="tag flag" style={{ marginLeft: 6 }}>looks like a duplicate</span>}{r.row.warnings?.map((w) => <span key={w} className="tag flag" style={{ marginLeft: 6 }} title={w}>check</span>)}</span>
+           <span className="cell"><select aria-label={`Category for ${r.row.description}`} value={r.categoryId ?? ''} onChange={(e) => upd(r.key, { categoryId: e.target.value ? +e.target.value : null, remember: true })}><option value="">Uncategorized</option>{cats.filter((c) => c.kind !== 'transfer' && (r.row.amount < 0 ? c.kind === 'expense' : c.kind === 'income')).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></span>
+-          <span className={`cell ${r.confidence < 0.7 ? 'err' : 'muted'}`}>{Math.round(r.confidence * 100)}%</span><span className="cell r"><Money v={r.row.amount} /></span></div>)}
++          <span className={`cell ${r.confidence < 0.7 ? 'err' : 'muted'}`}>{Math.round(r.confidence * 100)}%</span><span className="cell r"><Money v={r.row.amount} /></span><button className="link small" onClick={() => flip(r.key)} aria-label={`Flip direction of ${r.row.description}`} title="Swap money in and money out for this row">Flip</button></div>)}
+         </div></div>
+       {rows.length > 1500 && <p className="small muted">Showing the first 1,500 rows; the rest are included when you save.</p>}
+       <p className="small muted" style={{ marginTop: 8 }}>When you change a category, Tally remembers that merchant for next time.</p>
+diff --git a/tests/fixtures/make_pdfs.py b/tests/fixtures/make_pdfs.py
+index 5051481..7d62ecc 100644
+--- a/tests/fixtures/make_pdfs.py
++++ b/tests/fixtures/make_pdfs.py
+@@ -55,3 +55,33 @@ for d,desc,amt,sign in [("01/03/2026","SALARY ACME LTD",300000.0,"CR"),("02/03/2
+     bal += amt if sign=="CR" else -amt
+     c.drawString(40,y,d); c.drawString(110,y,desc); c.drawRightString(400,y,f"{amt:,.2f} {sign}"); c.drawRightString(555,y,f"{bal:,.2f}"); y-=16
+ c.drawString(40,y,"Carried Forward"); c.drawRightString(555,y,f"{bal:,.2f}"); c.save(); print(bal)
++
++# ---- more real-world layouts (added to reproduce the "everything imports as money in" bug) ----
++OPEN = 500000.00
++TX = [("01 Mar 2026","POS PURCHASE SHOPRITE LEKKI",-18500.00),("02 Mar 2026","NIP TRF FROM ADEOLA JOHNSON SALARY MARCH",450000.00),("03 Mar 2026","MTN AIRTIME VTU 08031234567",-2000.00),
++      ("04 Mar 2026","BOLT RIDE LAGOS",-3200.50),("05 Mar 2026","DSTV SUBSCRIPTION COMPACT PLUS",-10500.00),("07 Mar 2026","ATM WDL FIRST BANK VI BRANCH",-20000.00),
++      ("09 Mar 2026","TRANSFER FROM CHIDI OKAFOR REFUND",15000.00),("12 Mar 2026","TOTAL ENERGIES FILLING STATION",-25000.00)]
++CLOSE = OPEN + sum(a for _,_,a in TX)
++def frame(path, header_fn, row_fn):
++    c = canvas.Canvas(path, pagesize=A4); W,H = A4; y = H-60
++    c.setFont("Helvetica-Bold",14); c.drawString(40,y,"Example Bank Plc"); y-=16; c.setFont("Helvetica",9)
++    c.drawString(40,y,"Statement Period: 01 Mar 2026 to 31 Mar 2026"); y-=30
++    header_fn(c,y); y-=18; c.setFont("Helvetica",9)
++    c.drawString(110,y,"Opening Balance"); c.drawRightString(555,y,f"{OPEN:,.2f}"); y-=16
++    for t in TX: row_fn(c,y,*t); y-=16
++    c.drawString(110,y,"Closing Balance"); c.drawRightString(555,y,f"{CLOSE:,.2f}"); c.save()
++def h_amount_only(c,y):  # single Amount column, no balance, no CR/DR marks
++    c.setFont("Helvetica-Bold",9); c.drawString(40,y,"Date"); c.drawString(110,y,"Description"); c.drawRightString(555,y,"Amount")
++def r_amount_only(c,y,d,desc,a): c.drawString(40,y,d); c.drawString(110,y,desc); c.drawRightString(555,y,f"{abs(a):,.2f}")
++frame("tests/fixtures/stmt_amount_only.pdf", h_amount_only, r_amount_only)
++def h_typecol(c,y):
++    c.setFont("Helvetica-Bold",9); c.drawString(40,y,"Date"); c.drawString(110,y,"Description"); c.drawString(380,y,"Type"); c.drawRightString(555,y,"Amount")
++def r_typecol(c,y,d,desc,a): c.drawString(40,y,d); c.drawString(110,y,desc[:40]); c.drawString(380,y,"Credit" if a>0 else "Debit"); c.drawRightString(555,y,f"{abs(a):,.2f}")
++frame("tests/fixtures/stmt_typecol.pdf", h_typecol, r_typecol)
++def mk_cols(h1,h2):
++    def h(c,y): c.setFont("Helvetica-Bold",9); c.drawString(40,y,"Date"); c.drawString(110,y,"Narration"); c.drawRightString(440,y,h1); c.drawRightString(520,y,h2)
++    def r(c,y,d,desc,a): c.drawString(40,y,d); c.drawString(110,y,desc[:40]); c.drawRightString(440 if a<0 else 520,y,f"{abs(a):,.2f}")
++    return h,r
++for name,(h1,h2) in {"stmt_debitcredit_naira":("Debit (â‚¦)","Credit (â‚¦)"),"stmt_withdrawals":("Withdrawals","Lodgements")}.items():
++    h,r = mk_cols(h1,h2); frame(f"tests/fixtures/{name}.pdf", h, r)
++print("extra layouts written; closing", CLOSE)
+diff --git a/tests/fixtures/stmt_amount_only.pdf b/tests/fixtures/stmt_amount_only.pdf
+new file mode 100644
+index 0000000..a0f89cd
+--- /dev/null
++++ b/tests/fixtures/stmt_amount_only.pdf
+@@ -0,0 +1,74 @@
++%PDF-1.3
++%“Œ‹ž ReportLab Generated PDF document (opensource)
++1 0 obj
++<<
++/F1 2 0 R /F2 3 0 R
++>>
++endobj
++2 0 obj
++<<
++/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
++>>
++endobj
++3 0 obj
++<<
++/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
++>>
++endobj
++4 0 obj
++<<
++/Contents 8 0 R /MediaBox [ 0 0 595.2756 841.8898 ] /Parent 7 0 R /Resources <<
++/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
++>> /Rotate 0 /Trans <<
++
++>> 
++  /Type /Page
++>>
++endobj
++5 0 obj
++<<
++/PageMode /UseNone /Pages 7 0 R /Type /Catalog
++>>
++endobj
++6 0 obj
++<<
++/Author (anonymous) /CreationDate (D:20261011185401+00'00') /Creator (anonymous) /Keywords () /ModDate (D:20261011185401+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
++  /Subject (unspecified) /Title (untitled) /Trapped /False
++>>
++endobj
++7 0 obj
++<<
++/Count 1 /Kids [ 4 0 R ] /Type /Pages
++>>
++endobj
++8 0 obj
++<<
++/Filter [ /ASCII85Decode /FlateDecode ] /Length 706
++>>
++stream
++Gat%`>E>7-&;B$9=3P/Y7B(,XQbJkliW_*BSQ(#r;Hfnk8@4jYrV?,l]8aL-!Yl=\L3)KeI)["b\T!&U*<?c^*t&LEJGp&2TDP9SaRriR:<Z>F*mCDF3e"O,&VLaf7o=)/*oUE(B6u`_>"H*X05(j-pRm"frp\5C6en0)+gZ]*c.$<OBod+TJYp-<T>#^TKV@,V"$n2_b6biIj6K$BXH7'0b"Ni-i8mUj?[pcnm-aW2bPp#)Xe5gC&IMeY4.^nFQiCei?Q"W#%rlL!IJ:Xdp9<q-"2#>eo/Q5F,t2L%&2I@+M]UW(XA))MD0=KI73`L'CRHfCb!@UJ,Iu*nbZ?;Y^hI6n#Ee>(UD^b))+7M(&Xe16-u.UhQ3@t#<5>eEPRKa6AZ\?0MNpkaKo2;5\D:B0d\ikR%>*5ap81+0MFuL9\CA16@ADG),331lq(rA4H>>K-ijt4K9'TQDrY.t/ObcnfjI+\D[Ld2,bZ9$G@`[aB1=+)uU/T-L7Af\]e2gI+jGi;6X&DkQ/Ci+3lTrmqGWJ;2NQ.17;\VtM[1uA:n0KTYi)48[=M9:qLIAFo0Tn)Z[LF*M,dPH=T#,1lZlr=9/t_8S?1Nr,=Kt1`OEn+6ZOp<o$e$h4)Hef7;eFl`BVChS>O,NHGcj_YbECHb:msOZiARZF6uJ4^KgRBBl/D7gq7Lm8;+,&**4n!-GCKY&mBYd~>endstream
++endobj
++xref
++0 9
++0000000000 65535 f 
++0000000061 00000 n 
++0000000102 00000 n 
++0000000209 00000 n 
++0000000321 00000 n 
++0000000524 00000 n 
++0000000592 00000 n 
++0000000853 00000 n 
++0000000912 00000 n 
++trailer
++<<
++/ID 
++[<9c80c8c7dedf2deef5ae3a1483569eb6><9c80c8c7dedf2deef5ae3a1483569eb6>]
++% ReportLab generated PDF document -- digest (opensource)
++
++/Info 6 0 R
++/Root 5 0 R
++/Size 9
++>>
++startxref
++1708
++%%EOF
+diff --git a/tests/fixtures/stmt_debitcredit_naira.pdf b/tests/fixtures/stmt_debitcredit_naira.pdf
+new file mode 100644
+index 0000000..34e775f
+--- /dev/null
++++ b/tests/fixtures/stmt_debitcredit_naira.pdf
+@@ -0,0 +1,80 @@
++%PDF-1.3
++%“Œ‹ž ReportLab Generated PDF document (opensource)
++1 0 obj
++<<
++/F1 2 0 R /F2 3 0 R /F3 4 0 R
++>>
++endobj
++2 0 obj
++<<
++/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
++>>
++endobj
++3 0 obj
++<<
++/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
++>>
++endobj
++4 0 obj
++<<
++/BaseFont /ZapfDingbats /Name /F3 /Subtype /Type1 /Type /Font
++>>
++endobj
++5 0 obj
++<<
++/Contents 9 0 R /MediaBox [ 0 0 595.2756 841.8898 ] /Parent 8 0 R /Resources <<
++/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
++>> /Rotate 0 /Trans <<
++
++>> 
++  /Type /Page
++>>
++endobj
++6 0 obj
++<<
++/PageMode /UseNone /Pages 8 0 R /Type /Catalog
++>>
++endobj
++7 0 obj
++<<
++/Author (anonymous) /CreationDate (D:20261011185401+00'00') /Creator (anonymous) /Keywords () /ModDate (D:20261011185401+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
++  /Subject (unspecified) /Title (untitled) /Trapped /False
++>>
++endobj
++8 0 obj
++<<
++/Count 1 /Kids [ 5 0 R ] /Type /Pages
++>>
++endobj
++9 0 obj
++<<
++/Filter [ /ASCII85Decode /FlateDecode ] /Length 751
++>>
++stream
++Gatn#a_oie'LhclMRR[76QmmU6[,nlR'e9&FG^.QW/4]f[H53sU7Yd^),(s2V+"h.J8*keO5:uf8:PUYrNHB+.(IAQ?ioTu@*e@.jcHLCrg`29rnM_7dlDlbn.5^GG/>r]J*p^1rbZgSgD1Q!pD`Db__nB"TK^'$@>K4c1h>atPF4Nka*-'X8#Y1[B)hWD&;Ho>!("PYiu[")cgr87(??B"M9`@8hJQeMG-u,rLZZ,"G9>`:&90D#BD1`ebn9AV^#UM]D7!I?H@CT2]>#E.#XZS0St-H8g;j4*1=Do2*]Q.@<_mSAl$hoPDk$0'TSaFP:?6c1Os2_Q#WW/"PnF./N#!=H[`)i.l:OCV(@dR0']cR""]m/6l"\1%G&X3hcHpaNiLF5ooL#AcLePUk'IBqKM$u.:'u6!>ar,T+QDLZTO=Y&()\bt1`R$GdI;LQ/O,hfBpEKdoSH<XX$<7/f6Lc7R41,8,+r:pEUOFm2WAt&i]9#l^l5GoD'M;</W,`&n-bAX1[ZVkGVUD"K9h$dt\]-0F3ebdW,Z<HL>VBV=GceJnF^,Y=M\Xb;H3!SS4=qe:7`U^[>80aS2&/e"n28<2j$G4tY]9nk*#=-k6R2EPC"e[=M+$JE78l0?L!i@E9?#'q`CleAW)bIM"Gem=Qc[VR]Y^+DR#]#2ckp7TA`kY!WYEqNehRuL4I*LdH-XT;OGZ3I_WA(,7cZ==*ul,=*H1\%-GQ`9AJij@TFn8rJ?+1UACJ9~>endstream
++endobj
++xref
++0 10
++0000000000 65535 f 
++0000000061 00000 n 
++0000000112 00000 n 
++0000000219 00000 n 
++0000000331 00000 n 
++0000000414 00000 n 
++0000000617 00000 n 
++0000000685 00000 n 
++0000000946 00000 n 
++0000001005 00000 n 
++trailer
++<<
++/ID 
++[<a11774149b3110586ba9c73177b0032d><a11774149b3110586ba9c73177b0032d>]
++% ReportLab generated PDF document -- digest (opensource)
++
++/Info 7 0 R
++/Root 6 0 R
++/Size 10
++>>
++startxref
++1846
++%%EOF
+diff --git a/tests/fixtures/stmt_typecol.pdf b/tests/fixtures/stmt_typecol.pdf
+new file mode 100644
+index 0000000..5d96ce5
+--- /dev/null
++++ b/tests/fixtures/stmt_typecol.pdf
+@@ -0,0 +1,74 @@
++%PDF-1.3
++%“Œ‹ž ReportLab Generated PDF document (opensource)
++1 0 obj
++<<
++/F1 2 0 R /F2 3 0 R
++>>
++endobj
++2 0 obj
++<<
++/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
++>>
++endobj
++3 0 obj
++<<
++/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
++>>
++endobj
++4 0 obj
++<<
++/Contents 8 0 R /MediaBox [ 0 0 595.2756 841.8898 ] /Parent 7 0 R /Resources <<
++/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
++>> /Rotate 0 /Trans <<
++
++>> 
++  /Type /Page
++>>
++endobj
++5 0 obj
++<<
++/PageMode /UseNone /Pages 7 0 R /Type /Catalog
++>>
++endobj
++6 0 obj
++<<
++/Author (anonymous) /CreationDate (D:20261011185401+00'00') /Creator (anonymous) /Keywords () /ModDate (D:20261011185401+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
++  /Subject (unspecified) /Title (untitled) /Trapped /False
++>>
++endobj
++7 0 obj
++<<
++/Count 1 /Kids [ 4 0 R ] /Type /Pages
++>>
++endobj
++8 0 obj
++<<
++/Filter [ /ASCII85Decode /FlateDecode ] /Length 767
++>>
++stream
++Gat%agQ'uA&;KZJ.H[q<&@J'Mmn=5LP/NK"W-V%g[%`8)fMlVCI_Bj4fP#>.77)m"ruZ_3cNF?u&&.sZ%feBh+#==mJGKc.S[tJ78CcO-S`l?^\j$Y-lhK/M71b,s)MXCRo)S7-5F]Q)?c-^/r.8[uI1PTjW"8pa0LQ^5e7Ich=#8NIgA4W)/QDCgGJ*qY#XbjW"$sk\p'At:oemC"9&phG&tR'$G_sB62RIqcSp.)UGALSe38oi`rB5:jHN[+V$LD_X3<!gL2kA]7P;p'un5J00RNK*Jqb=Eab)W31jL_kK6YM&_dbB(RoQ5,pW&O"AJ@.=7;/lom9#M)e;ihAn$)UVAe)cbc*2r+`eDGFd#Eum8OWW<I31P6l8:G4d!0IjaQD.n).$6eBGQBWmGu!<S?^-_?+DFTi="(!omcLkBicBP*$2@a^9Ak,K7J$K!+EYU7RYjFs5abHM87AW$J3r=)ijbR%oK\fS]g^CD!O:\,+Hbh(7.(m9;_d=C!l5Ltp#qph*XYh'L;Jmn-:CdW4VWq(I)m6o@4Dnhef\$M)%0IoVXIa5Mi,L]WdN>%AXNu$P80/+?p>6E6j."u9EeE"HqAA"R#hYeZs:J:_+`4][ti&ZAqUmpL-#[/1EmaTA1Ei#^!'CEDb.eSQ8%5iRW/?PbuSE(",=f*LDM^EJA!*]0/WM8O-tH_6?,He(TC*IS>B+"/^IQ[#H?q9L$Zgb9LdOTMC8@%QV@ZR,KBW@_rrbJV$o_0&k%l<`,PGVJ!UR,~>endstream
++endobj
++xref
++0 9
++0000000000 65535 f 
++0000000061 00000 n 
++0000000102 00000 n 
++0000000209 00000 n 
++0000000321 00000 n 
++0000000524 00000 n 
++0000000592 00000 n 
++0000000853 00000 n 
++0000000912 00000 n 
++trailer
++<<
++/ID 
++[<45eb930f52f77f23172211e375773ae3><45eb930f52f77f23172211e375773ae3>]
++% ReportLab generated PDF document -- digest (opensource)
++
++/Info 6 0 R
++/Root 5 0 R
++/Size 9
++>>
++startxref
++1769
++%%EOF
+diff --git a/tests/fixtures/stmt_withdrawals.pdf b/tests/fixtures/stmt_withdrawals.pdf
+new file mode 100644
+index 0000000..992191a
+--- /dev/null
++++ b/tests/fixtures/stmt_withdrawals.pdf
+@@ -0,0 +1,74 @@
++%PDF-1.3
++%“Œ‹ž ReportLab Generated PDF document (opensource)
++1 0 obj
++<<
++/F1 2 0 R /F2 3 0 R
++>>
++endobj
++2 0 obj
++<<
++/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
++>>
++endobj
++3 0 obj
++<<
++/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
++>>
++endobj
++4 0 obj
++<<
++/Contents 8 0 R /MediaBox [ 0 0 595.2756 841.8898 ] /Parent 7 0 R /Resources <<
++/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
++>> /Rotate 0 /Trans <<
++
++>> 
++  /Type /Page
++>>
++endobj
++5 0 obj
++<<
++/PageMode /UseNone /Pages 7 0 R /Type /Catalog
++>>
++endobj
++6 0 obj
++<<
++/Author (anonymous) /CreationDate (D:20261011185401+00'00') /Creator (anonymous) /Keywords () /ModDate (D:20261011185401+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
++  /Subject (unspecified) /Title (untitled) /Trapped /False
++>>
++endobj
++7 0 obj
++<<
++/Count 1 /Kids [ 4 0 R ] /Type /Pages
++>>
++endobj
++8 0 obj
++<<
++/Filter [ /ASCII85Decode /FlateDecode ] /Length 737
++>>
++stream
++Gat%`?#Q2d'Sc)R/'d677EdZWO52es&hectmA/G^9!U'R5,omVp@IIQ[]ukGR#mC`Ic'blHl)r@%rU:*4ht1;k8XRNTYCR=]E!$SRD*IgM-4QE6SH0Vj(F8M5nmf^NYD#*%j/)Ac2M^lJT5c+"ncd+&bJlGT3g>-,cqsL1(3?s9O4+1B"p?2T\c3Ia7U66(s:tD"Ha6J8+<^SDZc-95e[s]2/ulRQ^nu.fig82;fgV5&+Au]j3UF3=)u'hr)fS[hp(Te^*j7S01`%B.ZWhMp@.8Fb$b[:UT9H#g`3bX#?-ajF'*Q)PG5ug_SB/LKLQ4j&"sJL'+%gL7pXYafPEu.'\!LNR5'tXRYb3gSO&C_kI`%QaV/=R]&7g$De"O,PupEY?oj1&f:Z[b\J-?o1_U%FY@:N];1W0[PM`$DjqJj+US,l6@i<YMgkK6H62O$BD+1ES?sIGQB!Bbm5V_ganH0\!>p0Yi6sLPV91aPi1)N>l/&n=1+F._%cDEr$OP*6U6jssH60;CbN9Cg.>ELDK"LT)IM<)),VUQ8Venh(S/f#J#0CA!@@FX&'`1E]:#cXq6\qKsfJ=K9/@Eb`3/3/Y8X1DL*Q.*/br>ga]0hR1>g'V\Q<1_3]F#9<TP_5@0>Y'rZ^8TJ_q0@_&]eJi+V6SRjGf\)j$8"(jGAEJc.F47#D,Ke;$;.Y&?FZP,a,&LtD$*:/?VbjcoAKN";8t=270^Sr$+Tj?S'\tY~>endstream
++endobj
++xref
++0 9
++0000000000 65535 f 
++0000000061 00000 n 
++0000000102 00000 n 
++0000000209 00000 n 
++0000000321 00000 n 
++0000000524 00000 n 
++0000000592 00000 n 
++0000000853 00000 n 
++0000000912 00000 n 
++trailer
++<<
++/ID 
++[<12c1b0a1a83da6df8b9d36f23b050554><12c1b0a1a83da6df8b9d36f23b050554>]
++% ReportLab generated PDF document -- digest (opensource)
++
++/Info 6 0 R
++/Root 5 0 R
++/Size 9
++>>
++startxref
++1739
++%%EOF
+diff --git a/tests/import.test.ts b/tests/import.test.ts
+index b24b4e1..bbba0fe 100644
+--- a/tests/import.test.ts
++++ b/tests/import.test.ts
+@@ -6,7 +6,8 @@ import { parseCsv, toCsv, parseCsvText } from '../src/core/import/csv';
+ import { parseOfx } from '../src/core/import/ofx';
+ import { parseQif } from '../src/core/import/qif';
+ import { parseAny, sniff, ImportError } from '../src/core/import';
+-import { prepareReview, commitReview, makeCategorizer, AlreadyImported } from '../src/core/ingest';
++import { parseStatementItems, solveDirections } from '../src/core/import/pdf';
++import { prepareReview, commitReview, makeCategorizer, AlreadyImported, flipRow } from '../src/core/ingest';
+ import { reconcile, auditReportHtml } from '../src/core/reconcile';
+ import { findDuplicates, findOutliers, detectSubscriptions, forecast, budgetStatus, insights, findGaps } from '../src/core/analytics';
+ import { ask } from '../src/core/nlq';
+@@ -131,3 +132,40 @@ describe('analytics', () => {
+     expect(ask(repo, 'blah blah', t).understood).toBe(false);
+   });
+ });
++
++describe('PDF direction (money in vs money out) â€” regression for "everything imported as money in"', () => {
++  const layouts: [string, string][] = [['single Amount column, no balance, no markers', 'stmt_amount_only.pdf'], ['Type column (Debit/Credit)', 'stmt_typecol.pdf'], ['headers "Debit (â‚¦)" / "Credit (â‚¦)", no balance', 'stmt_debitcredit_naira.pdf'], ['headers "Withdrawals" / "Lodgements", no balance', 'stmt_withdrawals.pdf']];
++  for (const [name, file] of layouts) it(`${name}: debits are money out, credits are money in, and opening + rows = closing`, async () => {
++    const r = await parseAny('s.pdf', pdf(file), pdfjs); const amounts = r.rows.map((x) => x.amount);
++    expect(amounts).toEqual([-1850000, 45000000, -200000, -320050, -1050000, -2000000, 1500000, -2500000]);
++    expect(r.rows.filter((x) => x.amount < 0)).toHaveLength(6); expect(r.rows.filter((x) => x.amount > 0)).toHaveLength(2);
++    expect(r.openingBalance! + amounts.reduce((a, b) => a + b, 0)).toBe(r.closingBalance);
++    expect(r.rows.every((x) => !x.description.match(/^(debit|credit)$/i) && !/\b(Debit|Credit)\b$/.test(x.description))).toBe(true); // Type cell is not left in the narration
++  });
++  it('explicit minus signs and brackets are trusted as money out', () => {
++    const it = (str: string, x: number, y: number) => ({ str, x, y, w: str.length * 5, page: 1 });
++    const pages = [[it('Date', 40, 700), it('Description', 110, 700), it('Amount', 500, 700), it('01 Mar 2026', 40, 680), it('GENERIC ITEM ONE', 110, 680), it('-1,500.00', 500, 680), it('02 Mar 2026', 40, 664), it('GENERIC ITEM TWO', 110, 664), it('(250.00)', 500, 664), it('03 Mar 2026', 40, 648), it('GENERIC ITEM THREE', 110, 648), it('4,000.00', 500, 648)]];
++    const r = parseStatementItems(pages as never); expect(r.rows.map((x) => x.amount)).toEqual([-150000, -25000, -400000]); // third row has no clue: assumed out and flagged
++    expect(r.rows[2].confidence).toBeLessThan(0.7); expect(r.warnings.join(' ')).toMatch(/could not be confirmed/);
++  });
++  it('rows with no clue at all are worked out from the statement balances (and the guess is flagged otherwise)', () => {
++    const it = (str: string, x: number, y: number, w = str.length * 5) => ({ str, x, y, w, page: 1 });
++    const mk = (open: string, close: string) => [[it('Date', 40, 700), it('Description', 110, 700), it('Amount', 500, 700), it('Opening Balance', 110, 684), it('10,000.00', 520, 684),
++      it('01 Mar 2026', 40, 668), it('ITEM ALPHA 1', 110, 668), it('3,000.00', 500, 668), it('02 Mar 2026', 40, 652), it('ITEM BETA 2', 110, 652), it('7,500.00', 500, 652), it('03 Mar 2026', 40, 636), it('ITEM GAMMA 3', 110, 636), it('1,250.00', 500, 636), it('Closing Balance', 110, 620), it(close, 520, 620)]];
++    // alpha out 3000, beta IN 7500, gamma out 1250 â†’ 10000 - 3000 + 7500 - 1250 = 13250
++    const ok = parseStatementItems(mk('10,000.00', '13,250.00') as never); expect(ok.rows.map((x) => x.amount)).toEqual([-300000, 750000, -125000]); expect(ok.rows.every((x) => x.confidence >= 0.9)).toBe(true); expect(ok.warnings.join(' ')).toMatch(/worked out from the opening and closing/);
++    const unsolvable = parseStatementItems(mk('10,000.00', '13,251.00') as never); expect(unsolvable.rows.every((x) => x.confidence < 0.7)).toBe(true);
++  });
++  it('solveDirections: finds the unique smallest fix, refuses ambiguous or impossible cases', () => {
++    const rows = [{ amount: -300 }, { amount: -700 }, { amount: -500 }]; // guessed all out; truth: second row is in â†’ total should be -300+700-500 = -100
++    expect(solveDirections(rows, [0, 1, 2], 1000, 900)).toEqual([1]); expect(solveDirections(rows, [0, 1, 2], 1000, 1000 - 1500)).toEqual([]);
++    expect(solveDirections([{ amount: -100 }, { amount: -100 }], [0, 1], 1000, 1000)).toBeNull(); // two equal rows: either could be the one â†’ ambiguous
++    expect(solveDirections(rows, [0, 1, 2], 1000, 1234)).toBeNull(); // odd/impossible difference
++  });
++  it('flipping a review row reverses its sign, re-suggests its category and stays importable (hashes are recomputed)', async () => {
++    const { repo, acct } = await freshRepo(); const parsed = parseCsv('Date,Description,Amount\n2026-03-01,SALARY ACME LTD,500.00\n2026-03-02,SHOPRITE LEKKI,500.00\n'); const cat = makeCategorizer(repo); let rv = prepareReview(repo, parsed, acct, cat);
++    const name = (id: number | null) => repo.categories().find((c) => c.id === id)?.name; expect(name(rv[0].categoryId)).toBe('Salary');
++    rv = rv.map((r) => flipRow(r, cat)); expect(rv.map((r) => r.row.amount)).toEqual([-50000, -50000]); expect(name(rv[0].categoryId)).not.toBe('Salary'); expect(name(rv[1].categoryId)).toBe('Groceries'); // was a credit, now a debit at Shoprite
++    commitReview(repo, acct, rv, cat, { fileBytes: new TextEncoder().encode('flip'), format: 'csv', parsed }); expect(repo.list().map((t) => t.amount)).toEqual([-50000, -50000]);
++  });
++});

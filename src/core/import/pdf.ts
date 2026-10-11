@@ -49,7 +49,34 @@ function toLines(pages: TextItem[][]): Line[] {
 const AMOUNT = /^[(\-]?(?:[₦N]\s?)?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?[)\-]?(?:\s?(?:CR|DR|Cr|Dr))?$|^[(\-]?\d+\.\d{2}[)\-]?(?:\s?(?:CR|DR|Cr|Dr))?$/;
 const isAmount = (s: string) => AMOUNT.test(s.replace(/\s/g, ' ').trim()) && /\d/.test(s) && (s.includes('.') || s.includes(',') || /(CR|DR)$/i.test(s));
 const DATE_AT_START = /^(\d{1,2}[-/. ](?:\d{1,2}|[A-Za-z]{3,9})(?:[-/. ,]+\d{2,4})?|\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4})(?=\s|$)/;
-const HEADER_WORDS = { debit: /^(debit|debits|withdrawals?|money out|paid out|dr)$/i, credit: /^(credit|credits|deposits?|money in|paid in|cr)$/i, balance: /^(balance|running balance|closing balance)$/i };
+/** Header cells are compared after stripping everything but letters, so "Debit (₦)", "DEBIT AMOUNT" and "Money Out" all match. */
+const norm = (t: string) => t.toLowerCase().replace(/[^a-z]/g, '');
+const HEADER_WORDS = {
+  debit: { test: (t: string) => { const n = norm(t); return n === 'dr' || /^(debit|withdraw|moneyout|paidout|outflow|paymentsout|amountout)/.test(n); } },
+  credit: { test: (t: string) => { const n = norm(t); return n === 'cr' || /^(credit|deposit|lodg?e?ment|moneyin|paidin|inflow|receipts|paymentsin|amountin)/.test(n); } },
+  balance: { test: (t: string) => /^(balance|runningbalance|closingbalance|bal)$/.test(norm(t)) || /^balance/.test(norm(t)) },
+};
+
+/** Last-resort direction clues from the narration when the layout gives no column, marker or running balance. */
+const POSITIVE = /\b(salary|payroll|wages|deposit|lodg?e?ment|interest (?:paid|credit)|credit interest|refund|reversal|cashback|dividend|transfer from|trf from|received|inward|credit alert)\b/i;
+const NEGATIVE = /\b(pos|wdl|withdrawal|atm|purchase|airtime|vtu|data bundle|bill|charge|fee|levy|stamp duty|vat|commission|subscription|transfer to|trf to|payment|debit|rent|maintenance|sms alert)\b/i;
+function cueDirection(desc: string): -1 | 0 | 1 { const p = POSITIVE.test(desc), n = NEGATIVE.test(desc); return p && !n ? 1 : n && !p ? -1 : p && n ? (/transfer from|trf from|salary|refund|reversal/i.test(desc) ? 1 : -1) : 0; }
+
+/** If the statement's opening and closing balances are known, find the (unique, smallest) set of guessed rows whose
+ *  direction must be flipped for opening + rows = closing. Returns indexes to flip, or null when it cannot be decided. */
+export function solveDirections(rows: { amount: number }[], guessed: number[], opening: number, closing: number): number[] | null {
+  const D = closing - opening - rows.reduce((s, r) => s + r.amount, 0); if (D === 0) return [];
+  if (D % 2 !== 0 || guessed.length === 0 || guessed.length > 24) return null;
+  const target = -D / 2; const vals = guessed.map((i) => rows[i].amount); const h = guessed.length >> 1;
+  const halves = [vals.slice(0, h), vals.slice(h)]; const sums = (a: number[]) => { const r: [number, number][] = [[0, 0]]; a.forEach((v, i) => { const n = r.length; for (let k = 0; k < n; k++) r.push([r[k][0] + v, r[k][1] | (1 << i)]); }); return r; };
+  const left = sums(halves[0]), right = new Map<number, number[]>(); for (const [sm, mask] of sums(halves[1])) (right.get(sm) ?? right.set(sm, []).get(sm)!).push(mask);
+  let best: number[] | null = null, bestN = 99, ties = 0;
+  for (const [sm, lm] of left) for (const rm of right.get(target - sm) ?? []) {
+    const idx = [...halves[0].map((_, i) => (lm >> i) & 1 ? guessed[i] : -1), ...halves[1].map((_, i) => (rm >> i) & 1 ? guessed[h + i] : -1)].filter((x) => x >= 0);
+    if (idx.length < bestN) { best = idx; bestN = idx.length; ties = 1; } else if (idx.length === bestN) ties++;
+  }
+  return best && ties === 1 ? best : null;
+}
 
 function loosDate(s: string, year: number | null, dayFirst = true): string | null {
   const direct = parseDate(s, dayFirst); if (direct) return direct;
@@ -70,7 +97,7 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
   // column anchors from the table header row
   let cols: { kind: 'debit' | 'credit' | 'balance'; c: number; r: number }[] = [];
   let prevBal: number | null = null; let descX: number | null = null; let last: ParsedRow | null = null; let seq = 0;
-  let balanceVerified = 0, balanceMismatch = 0;
+  let balanceVerified = 0, balanceMismatch = 0; const guessed: number[] = [];
 
   for (let li = 0; li < lines.length; li++) {
     const ln = lines[li]; const t = ln.text;
@@ -97,7 +124,8 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
     let cells = ln.cells.slice(); let rest = first.text.slice(dm![0].length).trim(); cells.shift();
     if (rest) cells.unshift({ text: rest, x0: first.x0 + 40, x1: first.x1 });
     if (cells[0] && DATE_AT_START.test(cells[0].text) && loosDate(DATE_AT_START.exec(cells[0].text)![1], year) && !isAmount(cells[0].text) && cells[0].text.length < 14) cells.shift(); // value date
-    const nums = cells.filter((c) => isAmount(c.text)); const textCells = cells.filter((c) => !isAmount(c.text));
+    const nums = cells.filter((c) => isAmount(c.text)); const isTypeCell = (c: Cell) => /^(debit|dr|d|credit|cr|c)$/i.test(c.text.trim());
+    const typeCell = cells.find((c) => !isAmount(c.text) && isTypeCell(c)); const textCells = cells.filter((c) => !isAmount(c.text) && !isTypeCell(c));
     let desc = sanitize(textCells.map((c) => c.text).join(' ')); if (!nums.length || !desc) { out.skipped.push({ line: li + 1, text: t.slice(0, 120), reason: !nums.length ? 'No amount found' : 'No description' }); continue; }
 
     let amount: number | null = null, balance: number | null = null; const warnings: string[] = []; let conf = 0.9;
@@ -111,8 +139,18 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
     if (amount === null && balance !== null && prevBal !== null) amount = balance - prevBal; // only a balance printed
     if (amount === null) { out.skipped.push({ line: li + 1, text: t.slice(0, 120), reason: 'Amount column unclear' }); continue; }
 
-    const marker = nums.map((n) => /DR$/i.test(n.text.trim()) ? -1 : /CR$/i.test(n.text.trim()) ? 1 : 0).find((m) => m !== 0);
-    if (!cols.length) { if (balance !== null && prevBal !== null) { const up: boolean = prevBal + Math.abs(amount) === balance, down: boolean = prevBal - Math.abs(amount) === balance; if (up !== down) amount = (up ? 1 : -1) * Math.abs(amount); } else if (marker) amount = marker * Math.abs(amount); else if (amount > 0) { warnings.push('Direction guessed — check sign'); conf = 0.55; } }
+    const marker = typeCell ? (/^(debit|dr|d)$/i.test(typeCell.text.trim()) ? -1 : 1) : nums.map((n) => /DR$/i.test(n.text.trim()) ? -1 : /CR$/i.test(n.text.trim()) ? 1 : 0).find((m) => m !== 0);
+    if (!cols.length) {
+      // Direction, in order of trust: running balance → explicit sign / DR-CR marker / Type column → narration clues → assume money out.
+      let decided = false;
+      if (balance !== null && prevBal !== null) { const up: boolean = prevBal + Math.abs(amount) === balance, down: boolean = prevBal - Math.abs(amount) === balance; if (up !== down) { amount = (up ? 1 : -1) * Math.abs(amount); decided = true; } }
+      if (!decided && marker) { amount = marker * Math.abs(amount); decided = true; }
+      if (!decided && amount < 0) decided = true; // the statement printed an explicit minus or brackets
+      if (!decided) {
+        const cue = cueDirection(desc); amount = (cue || -1) * Math.abs(amount); guessed.push(out.rows.length);
+        warnings.push(cue ? 'Direction inferred from the description' : 'Direction unknown, assumed money out'); conf = cue ? 0.6 : 0.5;
+      }
+    }
     if (balance !== null && prevBal !== null) {
       if (prevBal + amount === balance) { balanceVerified++; conf = 0.97; }
       else if (prevBal - amount === balance && amount !== 0) { amount = -amount; balanceVerified++; conf = 0.9; warnings.push('Sign corrected from running balance'); }
@@ -128,6 +166,16 @@ export function parseStatementItems(pages: TextItem[][]): ParsedStatement {
   if (!out.rows.length) throw new ImportError('No transactions could be read. This layout may need a bank template or a CSV export.');
   if (out.openingBalance == null) { const f = out.rows[0]; if (f.balance != null) out.openingBalance = f.balance - f.amount; }
   if (out.closingBalance == null) { const l = [...out.rows].reverse().find((r) => r.balance != null); if (l) out.closingBalance = l.balance; }
+  if (guessed.length) {
+    // No column or marker told us the direction for these rows. If the statement's opening and closing balances are known,
+    // they can confirm or correct the guesses: opening + every signed row must equal closing.
+    const flip = out.openingBalance != null && out.closingBalance != null ? solveDirections(out.rows, guessed, out.openingBalance, out.closingBalance) : null;
+    if (flip) {
+      for (const i of flip) out.rows[i].amount = -out.rows[i].amount;
+      for (const i of guessed) { const r = out.rows[i]; r.confidence = 0.9; r.warnings = flip.includes(i) ? ['Direction corrected using the statement balances'] : undefined; } // confirmed rows need no flag
+      out.warnings.push(`${guessed.length} row(s) did not state money in or out; the direction was worked out from the opening and closing balances${flip.length ? ` (${flip.length} corrected)` : ''}.`);
+    } else out.warnings.push(`${guessed.length} row(s) did not state money in or out and could not be confirmed against the statement balances. Directions were guessed from the descriptions, so check them (use Flip in the review).`);
+  }
   if (balanceMismatch) out.warnings.push(`${balanceMismatch} row(s) do not follow the running balance — review the flagged lines.`);
   if (!balanceVerified && !cols.length) out.warnings.push('No running balance was found, so amounts could not be cross-checked.');
   return out;

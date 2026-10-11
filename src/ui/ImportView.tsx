@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { useApp } from './store';
 import { Money, Section, Empty } from './ui';
 import { parseInWorker } from './parse';
-import { prepareReview, commitReview, AlreadyImported, type ReviewRow } from '../core/ingest';
+import { prepareReview, commitReview, flipRow, AlreadyImported, type ReviewRow } from '../core/ingest';
 import type { ParsedStatement } from '../core/import/types';
 import { reconcile } from '../core/reconcile';
 import { formatMoney } from '../core/money';
@@ -20,10 +20,12 @@ export function ImportView() {
       setParsed(res); setRows(prepareReview(repo, res, acct, cat));
     } catch (e) { setErr(e instanceof Error ? e.message : 'Could not read this file'); } finally { setBusy(false); }
   }
+  const flip = (k: number) => setRows((r) => r.map((x) => (x.key === k ? flipRow(x, cat) : x)));
   const upd = (k: number, p: Partial<ReviewRow>) => setRows((r) => r.map((x) => (x.key === k ? { ...x, ...p } : x)));
   const accepted = rows.filter((r) => r.accept); const flagged = rows.filter((r) => r.confidence < 0.7 || r.dup !== 'none' || r.row.warnings?.length);
+  // recomputed on every render so flips show immediately
   const sum = accepted.reduce((s, r) => s + r.row.amount, 0);
-  const check = parsed && parsed.openingBalance != null && parsed.closingBalance != null ? parsed.openingBalance + parsed.rows.reduce((s, r) => s + r.amount, 0) - parsed.closingBalance : null;
+  const check = parsed && parsed.openingBalance != null && parsed.closingBalance != null ? parsed.openingBalance + rows.reduce((s, r) => s + r.row.amount, 0) - parsed.closingBalance : null;
 
   function save() {
     if (!parsed) return;
@@ -57,14 +59,14 @@ export function ImportView() {
       </div>
       <div className="row" style={{ marginBottom: 10 }}>
         <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= minConf })))}>Accept all new</button><button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: false })))}>Reject all</button>
-        <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= 0.9 })))}>Only the confident ones</button><span className="muted small">{flagged.length} flagged for a second look</span></div>
-      <div className="tbl"><div className="hd" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px' }}><span /><span>Date</span><span>Description</span><span>Category</span><span>Sure</span><span className="r">Amount</span></div>
-        <div className="scroll">{rows.slice(0, 1500).map((r) => <div key={r.key} className="tr" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px', opacity: r.accept ? 1 : 0.55 }}>
+        <button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => ({ ...x, accept: x.dup === 'none' && x.confidence >= 0.9 })))}>Only the confident ones</button><button className="btn small quiet" onClick={() => setRows((r) => r.map((x) => flipRow(x, cat)))} title="Swap money in and money out on every row">Flip every row</button><span className="muted small">{flagged.length} flagged for a second look</span></div>
+      <div className="tbl"><div className="hd" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px 44px' }}><span /><span>Date</span><span>Description</span><span>Category</span><span>Sure</span><span className="r">Amount</span><span /></div>
+        <div className="scroll">{rows.slice(0, 1500).map((r) => <div key={r.key} className="tr" style={{ ['--cols' as string]: '24px 88px 1fr 150px 48px 108px 44px', opacity: r.accept ? 1 : 0.55 }}>
           <input type="checkbox" aria-label={`Accept ${r.row.description}`} checked={r.accept} onChange={(e) => upd(r.key, { accept: e.target.checked })} />
           <span className="cell muted small">{r.row.date}</span>
           <span className="cell" title={`${r.row.description}${r.row.page ? ` — page ${r.row.page}, row ${r.row.line}` : ''}`}>{r.row.description}{r.dup === 'exact' && <span className="tag bad" style={{ marginLeft: 6 }}>already saved</span>}{r.dup === 'possible' && <span className="tag flag" style={{ marginLeft: 6 }}>looks like a duplicate</span>}{r.row.warnings?.map((w) => <span key={w} className="tag flag" style={{ marginLeft: 6 }} title={w}>check</span>)}</span>
           <span className="cell"><select aria-label={`Category for ${r.row.description}`} value={r.categoryId ?? ''} onChange={(e) => upd(r.key, { categoryId: e.target.value ? +e.target.value : null, remember: true })}><option value="">Uncategorized</option>{cats.filter((c) => c.kind !== 'transfer' && (r.row.amount < 0 ? c.kind === 'expense' : c.kind === 'income')).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></span>
-          <span className={`cell ${r.confidence < 0.7 ? 'err' : 'muted'}`}>{Math.round(r.confidence * 100)}%</span><span className="cell r"><Money v={r.row.amount} /></span></div>)}
+          <span className={`cell ${r.confidence < 0.7 ? 'err' : 'muted'}`}>{Math.round(r.confidence * 100)}%</span><span className="cell r"><Money v={r.row.amount} /></span><button className="link small" onClick={() => flip(r.key)} aria-label={`Flip direction of ${r.row.description}`} title="Swap money in and money out for this row">Flip</button></div>)}
         </div></div>
       {rows.length > 1500 && <p className="small muted">Showing the first 1,500 rows; the rest are included when you save.</p>}
       <p className="small muted" style={{ marginTop: 8 }}>When you change a category, Tally remembers that merchant for next time.</p>
