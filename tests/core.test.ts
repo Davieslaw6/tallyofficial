@@ -174,3 +174,15 @@ describe('plain local vault (no passphrase)', () => {
     const store = new MemoryStore(); const vm = new VaultManager(store); await vm.create('Old', 'lantern-orbit-ferry-77', FAST_KDF); await expect(vm.openPlain()).rejects.toThrow(/older passphrase-protected/);
   });
 });
+
+describe('spent today', () => {
+  it("counts only today's money out; ignores income, transfers and other days; splits count once", async () => {
+    const { repo, acct } = await freshRepo(); const sav = repo.addAccount('Savings', 'savings', 0); const today = '2026-10-11';
+    repo.addTx({ account_id: acct, date: today, amount: -250000, description: 'Lunch' });
+    const big = repo.addTx({ account_id: acct, date: today, amount: -100000, description: 'Market' }); repo.setSplits(big, [{ category_id: 3, amount: -60000 }, { category_id: 4, amount: -40000 }]);
+    repo.addTx({ account_id: acct, date: today, amount: 9000000, description: 'Salary' }); repo.addTransfer(acct, sav, 500000, today);
+    repo.addTx({ account_id: acct, date: '2026-10-10', amount: -777700, description: 'Yesterday' });
+    expect(repo.incomeExpense(today, today).expense).toBe(350000); expect(repo.list({ from: today, to: today }).filter((t) => t.amount < 0 && !t.transfer_group)).toHaveLength(2);
+    expect(repo.incomeExpense('2026-10-12', '2026-10-12').expense).toBe(0);
+  });
+});

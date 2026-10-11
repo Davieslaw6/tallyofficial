@@ -26,6 +26,8 @@ export function loadSample(repo: Repo, today: string): number {
   }
   repo.addTx({ account_id: cur, date: addDays(today, -9), amount: -38_500_000, description: 'JUMIA LAPTOP ORDER', category_id: C('Shopping'), source: 'sample' });
   for (const [n, b] of [['Groceries', 8_000_000], ['Eating out', 2_500_000], ['Transport', 2_000_000], ['Shopping', 3_000_000]] as const) repo.setBudget(C(n)!, b);
+  repo.addTx({ account_id: cur, date: today, amount: -420000, description: 'CHICKEN REPUBLIC IKEJA', category_id: C('Eating out'), source: 'sample' });
+  repo.addTx({ account_id: cur, date: today, amount: -185000, description: 'BOLT RIDE', category_id: C('Transport'), source: 'sample' });
   repo.addGoal('Emergency fund', 150_000_000, addMonths(today, 10), 40_000_000);
   repo.addRecurring({ account_id: cur, description: 'RENT LANDLORD TRF', amount: -15_000_000, category_id: C('Rent'), frequency: 'monthly', next_due: addMonths(first, 6) });
   return cur;

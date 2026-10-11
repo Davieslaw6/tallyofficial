@@ -3,7 +3,7 @@ import { useApp } from './store';
 import { Money, Ribbon, Section, Empty } from './ui';
 import { MonthsChart, Outlook } from './charts';
 import { formatMoney, compactMoney } from '../core/money';
-import { monthRange, shiftMonth } from '../core/dates';
+import { monthRange, shiftMonth, monthKey } from '../core/dates';
 import { budgetStatus, insights, forecast } from '../core/analytics';
 
 const MN = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -18,7 +18,8 @@ export function Today({ play }: { play: boolean }) {
     const accts = repo.accounts().map((x) => ({ ...x, bal: repo.balance(x.id) }));
     const lastStatement = repo.db.one<{ account_id: number; period_end: string; closing_balance: number }>('SELECT account_id, period_end, closing_balance FROM statements WHERE period_end IS NOT NULL ORDER BY period_end DESC LIMIT 1');
     const unreviewed = repo.db.scalar<number>('SELECT COUNT(*) FROM transactions WHERE category_id IS NULL AND transfer_group IS NULL') ?? 0;
-    return { cats, ie, pie, prev, series, accts, lastStatement, unreviewed, ins: insights(repo, month).slice(0, 4), bud: budgetStatus(repo, month).slice(0, 4), fc: forecast(repo, today, 60) };
+    const tdy = repo.incomeExpense(today, today); const tdyCount = repo.list({ from: today, to: today }).filter((t) => t.amount < 0 && !t.transfer_group).length;
+    return { tdy, tdyCount, cats, ie, pie, prev, series, accts, lastStatement, unreviewed, ins: insights(repo, month).slice(0, 4), bud: budgetStatus(repo, month).slice(0, 4), fc: forecast(repo, today, 60) };
   }, [repo, month, v, today]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const total = d.accts.reduce((s, a) => s + a.bal, 0);
@@ -31,6 +32,7 @@ export function Today({ play }: { play: boolean }) {
     <div className="row" style={{ marginTop: 6 }}><button className="btn quiet small" onClick={() => setMonth(shiftMonth(month, -1))} aria-label="Previous month">Earlier</button><strong style={{ fontFamily: 'var(--font)' }}>{monthName(month)}</strong><button className="btn quiet small" onClick={() => setMonth(shiftMonth(month, 1))} aria-label="Next month">Later</button></div>
     {empty ? <><h1 className="headline">Nothing recorded for {monthName(month).split(' ')[0]} yet.</h1><p className="muted">Import a bank statement or add what you spent by hand.</p><div className="row"><button className="btn" onClick={() => go('import')}>Import a statement</button><button className="btn quiet" onClick={openAdd}>Add a transaction</button></div></>
       : <h1 className="headline">You spent {formatMoney(d.ie.expense, { symbol: true })} in {monthName(month).split(' ')[0]}{d.pie.expense > 0 && diff !== 0 ? <> — {formatMoney(Math.abs(diff))} {diff < 0 ? 'less' : 'more'} than {monthName(d.prev).split(' ')[0]}.</> : '.'}</h1>}
+    {!empty && month === monthKey(today) && <p className="today-line" data-testid="spent-today">{d.tdy.expense > 0 ? <>Today you’ve spent <strong>{formatMoney(d.tdy.expense)}</strong> across {d.tdyCount} transaction{d.tdyCount === 1 ? '' : 's'}.</> : <>Nothing spent yet today.</>}</p>}
     {!empty && <><Ribbon play={play} parts={d.cats.map((c) => ({ id: c.category_id, name: c.name, value: c.total }))} onPick={(id) => { setFilterCat(id); go('money'); }} /></>}
     <div className="facts">
       <div><div className="l">Money you have</div><div className="v"><Money v={total} plain /></div></div>

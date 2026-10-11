@@ -19,6 +19,8 @@ describe('UI smoke: opens without a passphrase → setup → every screen → ad
     await u.click(screen.getByRole('button', { name: 'Fill with sample data' }));
     const h = await screen.findByRole('heading', { level: 1 }, { timeout: 8000 }); expect(h.textContent).toMatch(/You spent .*₦/);
     expect(screen.getByRole('img', { name: /Groceries|Rent/ })).toBeTruthy();
+    const t = screen.getByTestId('spent-today').textContent!; const m = /Today you.ve spent ₦([\d,]+\.\d{2}) across (\d+) transactions/.exec(t); expect(m).not.toBeNull();
+    expect(Number(m![1].replace(/,/g, ''))).toBeGreaterThanOrEqual(6050); expect(Number(m![2])).toBeGreaterThanOrEqual(2); // at least the two purchases dated today in the sample (₦4,200 + ₦1,850)
     for (const name of ['Money', 'Import', 'Check', 'Plan', 'Settings', 'Today']) {
       await u.click(nav(name)); await waitFor(() => expect(document.querySelector('main')!.textContent!.length).toBeGreaterThan(20));
       expect(document.querySelector('kbd')).toBeNull(); expect(document.body.textContent).not.toMatch(/Ctrl|⌘|passphrase|Lock now/i); // no visible shortcuts, no lock
